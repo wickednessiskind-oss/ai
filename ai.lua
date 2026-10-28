@@ -1,41 +1,53 @@
 --!nocheck
 --[[
-    AI SCRIPT HELPER  —  single-file Roblox executor script (Luau / mobile)
+    ██████╗  AI HELPER  —  single-file Roblox executor script (Luau)
     ==================================================================
-    Providers, automatic fallback chain:
-        1. TokenHarbor   (OpenAI-compatible /chat/completions)
-        2. Google Gemini (generateContent — supports old "AIza…" *and* new "AQ.…" keys)
-        3. OpenRouter    (free models)
+    A small, friendly AI panel for Roblox executors (Delta / mobile ready).
+
+                     providers, in order:
+        1. TokenHarbor   (OpenAI-compatible)
+        2. Google Gemini (key from aistudio.google.com/apikey)
+        3. OpenRouter    (live list of the models that are free *right now*)
+
     ------------------------------------------------------------------
-    CHANGELOG
-    v3  (mobile / Delta fixes)
-      * HTTP resolver rewritten. v2 looked the function up in `_G`, but Delta
-        injects `request` / `http_request` into the *script environment*, not
-        into `_G` — so it always reported "no HTTP function". Now reads the
-        globals directly, then getgenv(), then syn/http/fluxus/krnl tables.
-      * Gemini: new Google keys start with "AQ." and MUST be sent in the
-        x-goog-api-key header; with ?key= they return 404. Both auth styles are
-        tried, and a dead model id falls through to the next model.
-      * GUI rebuilt: compact (≈300×420), fits any screen, real drag with
-        clamping, layout calculated from the panel size so nothing overlaps.
+    v4
+      * LIVE MODEL LISTS. OpenRouter's free tier changes weekly, so the
+        hardcoded ":free" slugs kept 404-ing. The script now fetches
+        https://openrouter.ai/api/v1/models and keeps only entries whose
+        prompt+completion price is 0. Gemini does the same with
+        /v1beta/models, filtered to models that support generateContent.
+      * MODEL PICKER for both providers — tap a model row, pick from the
+        live list, choice is remembered.
+      * AUTO-FALLBACK across the fetched list, so a retired model can no
+        longer take the whole thing down; ends with openrouter/free.
+      * ONE-LINE failure summary per provider at the end of an attempt.
+      * GUI redesigned: gradient panels, coloured accents, rounded chips,
+        hover/press states, comfortable tap targets, real type hierarchy.
+    v3
+      * Delta's `request` is injected into the script environment, not
+        into _G — the old _G lookup was why it said "no HTTP function".
+      * Gemini "AQ.…" keys must go in the x-goog-api-key header (?key=
+        404s), so both auth styles are attempted.
     v2
-      * REMOVED goto/label (::done::) — Luau has no goto, so v1 never compiled.
-      * Fence parser, bounded game scan, request timeouts, CoreGui fallback,
-        generated code on its own thread, settings panel for API keys.
+      * Removed goto/::done:: (Luau has no goto, v1 never compiled).
+      * Fence parser, bounded game scan, timeouts, CoreGui fallback,
+        generated code on its own thread, safe re-execution.
     ------------------------------------------------------------------
-    Everything lives inside a do-block so re-executing is always safe.
+    Keys are never stored in this file. Paste them in ⚙ once.
+    Everything is inside a do-block, so re-running is always safe.
 ]]
 
-do -- ══════════════════════════════════ SCOPE ══════════════════════════════════
+do --════════════════════════════════════ SCOPE ════════════════════════════════════
 
--- ══════════════════════════════════════════════════════════════════════════════
--- 0.  SERVICES + SAFE BOOT
--- ══════════════════════════════════════════════════════════════════════════════
+--══════════════════════════════════════════════════════════════════════════════
+-- 1.  SERVICES + SAFE BOOT
+--══════════════════════════════════════════════════════════════════════════════
 local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local HttpService       = game:GetService("HttpService")
 local UserInputService  = game:GetService("UserInputService")
 local StarterGui        = game:GetService("StarterGui")
+local TweenService      = game:GetService("TweenService")
 
 do
     local t0 = os.clock()
@@ -52,46 +64,37 @@ local function Notify(title, text, duration)
     end)
 end
 
--- ══════════════════════════════════════════════════════════════════════════════
--- 1.  CONFIG  (keys can also be typed in the ⚙ panel in-game)
--- ══════════════════════════════════════════════════════════════════════════════
+--══════════════════════════════════════════════════════════════════════════════
+-- 2.  CONFIG  (keys stay empty here — paste them in the ⚙ panel)
+--══════════════════════════════════════════════════════════════════════════════
 local CONFIG = {
-    -- Leave these empty in the file (a live key must never be committed to a
-    -- public repo — GitHub push protection blocks it anyway). Paste your keys
-    -- in the ⚙ panel; they are saved to ai_helper_keys.json when the executor
-    -- supports writefile, otherwise they last for the session.
     tokenharbor = {
         key   = "",
         model = "deepseek/deepseek-v4.1-flash:free",
         url   = "https://api.tokenharbor.ai/v1/chat/completions",
     },
     gemini = {
-        -- AQ.… = current Google key format, AIza… = legacy format. Both work below.
         key  = "",
         base = "https://generativelanguage.googleapis.com/v1beta/models/",
-        models = {
-            { label = "gemini-2.5-flash",      id = "gemini-2.5-flash" },
-            { label = "gemini-2.5-flash-lite", id = "gemini-2.5-flash-lite" },
-            { label = "gemini-2.0-flash",      id = "gemini-2.0-flash" },
-            { label = "gemini-2.0-flash-lite", id = "gemini-2.0-flash-lite" },
-        },
+        list = "https://generativelanguage.googleapis.com/v1beta/models",
+        -- used only when the live list can't be fetched (offline / bad key)
+        fallback = { "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash",
+                     "gemini-2.5-flash-lite" },
     },
     openrouter = {
-        key  = "",
-        url  = "https://openrouter.ai/api/v1/chat/completions",
-        models = {
-            "deepseek/deepseek-r1:free",
-            "deepseek/deepseek-chat-v3-0324:free",
-            "meta-llama/llama-3.3-70b-instruct:free",
-        },
+        key   = "",
+        url   = "https://openrouter.ai/api/v1/chat/completions",
+        list  = "https://openrouter.ai/api/v1/models",
+        -- used only when the live list can't be fetched
+        fallback = { "openrouter/free", "meta-llama/llama-3.3-70b-instruct:free",
+                     "qwen/qwen3-coder:free" },
     },
 }
 
 local MAX_CTX      = 8
-local HTTP_TIMEOUT = 60
+local HTTP_TIMEOUT = 45
 local MAX_TOKENS   = 4096
-
-local selectedGeminiIdx = 1
+local PREF_FILE    = "ai_helper_keys.json"
 
 local KEYS = {
     tokenharbor = CONFIG.tokenharbor.key,
@@ -99,12 +102,15 @@ local KEYS = {
     openrouter  = CONFIG.openrouter.key,
 }
 
-local KEYS_FILE = "ai_helper_keys.json"
+--══════════════════════════════════════════════════════════════════════════════
+-- 3.  PERSISTENCE  (keys + chosen models, when the executor has writefile)
+--══════════════════════════════════════════════════════════════════════════════
+local Prefs = { keys = KEYS, models = {} }
 
-local function readKeysFile()
+local function readPrefs()
     local ok, raw = pcall(function()
         if type(isfile) == "function" and type(readfile) == "function" then
-            if isfile(KEYS_FILE) then return readfile(KEYS_FILE) end
+            if isfile(PREF_FILE) then return readfile(PREF_FILE) end
         end
         return nil
     end)
@@ -114,87 +120,84 @@ local function readKeysFile()
     return nil
 end
 
-local function saveKeysFile()
+local function savePrefs()
     pcall(function()
         if type(writefile) == "function" then
-            writefile(KEYS_FILE, HttpService:JSONEncode(KEYS))
+            writefile(PREF_FILE, HttpService:JSONEncode(Prefs))
         end
     end)
 end
 
 do
-    local stored = readKeysFile()
+    local stored = readPrefs()
     if stored then
-        for k in pairs(KEYS) do
-            if type(stored[k]) == "string" and stored[k] ~= "" then
-                KEYS[k] = stored[k]
+        -- new layout: { keys = {...}, models = {...} }
+        if type(stored.keys) == "table" then
+            for k in pairs(KEYS) do
+                if type(stored.keys[k]) == "string" then KEYS[k] = stored.keys[k] end
             end
+        end
+        if type(stored.models) == "table" then
+            for k, v in pairs(stored.models) do
+                if type(v) == "string" and v ~= "" then Prefs.models[k] = v end
+            end
+        end
+        -- old layout: { gemini = "...", openrouter = "..." }
+        for k in pairs(KEYS) do
+            if type(stored[k]) == "string" and stored[k] ~= "" then KEYS[k] = stored[k] end
         end
     end
 end
 
--- ══════════════════════════════════════════════════════════════════════════════
--- 2.  HTTP RESOLVER
---     (this is what v2 got wrong: executors inject `request` into the script
---      environment, NOT into `_G`, so `_G["request"]` was always nil)
--- ══════════════════════════════════════════════════════════════════════════════
+--══════════════════════════════════════════════════════════════════════════════
+-- 4.  HTTP RESOLVER
+--     Executors inject `request` into the script environment, not into _G,
+--     so read the globals first and only then the shared env / namespaces.
+--══════════════════════════════════════════════════════════════════════════════
 local RawRequest, HTTP_SOURCE = nil, nil
 
 do
-    local candidates = {}
+    local found = {}
     local function add(name, fn)
-        if type(fn) == "function" then
-            candidates[#candidates + 1] = { name = name, fn = fn }
-        end
+        if type(fn) == "function" then found[#found + 1] = { name = name, fn = fn } end
     end
 
-    -- 1) direct globals — reading an undefined global is nil, never an error
     add("request",      request)
     add("http_request", http_request)
 
-    -- 2) the executor's shared environment
     local okGenv, genv = pcall(function() return getgenv and getgenv() or nil end)
     if okGenv and type(genv) == "table" then
         add("getgenv().request",      genv.request)
         add("getgenv().http_request", genv.http_request)
-        if type(genv.syn) == "table"  then add("getgenv().syn.request",  genv.syn.request)  end
+        if type(genv.syn)  == "table" then add("getgenv().syn.request",  genv.syn.request)  end
         if type(genv.http) == "table" then add("getgenv().http.request", genv.http.request) end
     end
 
-    -- 3) executor namespaces
-    if type(syn) == "table"    then add("syn.request",    syn.request)    end
-    if type(http) == "table"   then add("http.request",   http.request)   end
-    if type(fluxus) == "table" then add("fluxus.request", fluxus.request) end
-    if type(krnl) == "table"   then add("krnl.request",   krnl.request)   end
-    if type(delta) == "table"  then add("delta.request",  delta.request)  end
+    if type(syn)    == "table"  then add("syn.request",    syn.request)    end
+    if type(http)   == "table"  then add("http.request",   http.request)   end
+    if type(fluxus) == "table"  then add("fluxus.request", fluxus.request) end
+    if type(krnl)   == "table"  then add("krnl.request",   krnl.request)   end
+    if type(delta)  == "table"  then add("delta.request",  delta.request)  end
     if type(secure_call) == "function" and type(syn) == "table" and type(syn.request) == "function" then
         add("secure_call(syn.request)", function(o) return secure_call(syn.request, o) end)
     end
 
-    if #candidates > 0 then
-        RawRequest  = candidates[1].fn
-        HTTP_SOURCE = candidates[1].name
+    if #found > 0 then
+        RawRequest  = found[1].fn
+        HTTP_SOURCE = found[1].name
     end
 end
 
--- Unifies the different executor response shapes -> statusCode, bodyString
-local function runRequest(opts)
+local function HttpCall(opts)
+    if not RawRequest then return 0, "no http function available in this executor" end
     if opts.Timeout == nil then opts.Timeout = HTTP_TIMEOUT end
     local ok, res = pcall(RawRequest, opts)
     if not ok then return 0, "request error: " .. tostring(res) end
     if type(res) ~= "table" then return 0, "request returned " .. type(res) end
-
     local code = res.StatusCode or res.Status or res.status or res.statusCode or 0
     local body = res.Body or res.body or res.Data or res.data or ""
     if type(body) ~= "string" then body = tostring(body) end
     return tonumber(code) or 0, body
-end
-
-local function HttpCall(opts)
-    if not RawRequest then
-        return 0, "no http function available in this executor"
-    end
-    return runRequest(opts)
 end
 
 local function JsonDecode(str)
@@ -215,17 +218,25 @@ local function UrlEncode(str)
     end))
 end
 
--- ══════════════════════════════════════════════════════════════════════════════
--- 3.  GAME SCANNER  (bounded + non-blocking)
--- ══════════════════════════════════════════════════════════════════════════════
+local function shortErr(body, limit)
+    local d = JsonDecode(body)
+    if d and d.error then
+        local e = d.error
+        if type(e) == "table" then return tostring(e.message or e.status or e.code or "error") end
+        if type(e) == "string" then return e end
+    end
+    if d and d.message then return tostring(d.message) end
+    return tostring(body or ""):sub(1, limit or 120)
+end
+
+--══════════════════════════════════════════════════════════════════════════════
+-- 5.  GAME SCANNER  (bounded, never freezes the client)
+--══════════════════════════════════════════════════════════════════════════════
 local function collectBounded(root, maxDepth, maxNodes)
-    local out     = {}
-    local queue   = { { inst = root, depth = 0 } }
-    local head    = 1
-    local visited = 0
+    local out, queue = {}, { { inst = root, depth = 0 } }
+    local head, visited = 1, 0
     while head <= #queue and visited < maxNodes do
-        local node = queue[head]
-        head = head + 1
+        local node = queue[head]; head = head + 1
         if node.depth < maxDepth then
             local ok, kids = pcall(function() return node.inst:GetChildren() end)
             if ok and kids then
@@ -253,10 +264,9 @@ local function ScanGame()
             local h = obj:FindFirstChildOfClass("Humanoid")
             if h and h.Health > 0 then
                 npcs[#npcs + 1] = {
-                    Name = obj.Name, HP = math.floor(h.Health),
-                    MaxHP = math.floor(h.MaxHealth),
+                    Name = obj.Name, HP = math.floor(h.Health), MaxHP = math.floor(h.MaxHealth),
                 }
-                if #npcs >= 25 then break end
+                if #npcs >= 20 then break end
             end
         end
     end
@@ -265,7 +275,7 @@ local function ScanGame()
     for _, obj in ipairs(collectBounded(ReplicatedStorage, 3, 3000)) do
         if obj:IsA("RemoteEvent") or obj:IsA("RemoteFunction") then
             remotes[#remotes + 1] = obj.ClassName .. ": " .. obj:GetFullName()
-            if #remotes >= 40 then break end
+            if #remotes >= 30 then break end
         end
     end
 
@@ -286,7 +296,7 @@ local function ScanGame()
     for _, obj in ipairs(workspace:GetChildren()) do
         if obj:IsA("Folder") or obj:IsA("Model") then
             wsObjs[#wsObjs + 1] = obj.ClassName .. ": " .. obj.Name
-            if #wsObjs >= 30 then break end
+            if #wsObjs >= 25 then break end
         end
     end
 
@@ -297,38 +307,244 @@ local function ScanGame()
 
     return HttpService:JSONEncode({
         PlaceID = game.PlaceId, GameName = gameName,
-        PlayerCount = #Players:GetPlayers(),
-        PlayerName = LP and LP.Name or "?",
+        PlayerCount = #Players:GetPlayers(), PlayerName = LP and LP.Name or "?",
         Position = string.format("%.1f,%.1f,%.1f", pos.X, pos.Y, pos.Z),
         Tools = tools, NPCs = npcs, RemoteEvents = remotes, WorkspaceObjects = wsObjs,
     })
 end
 
--- ══════════════════════════════════════════════════════════════════════════════
--- 4.  PROVIDERS
--- ══════════════════════════════════════════════════════════════════════════════
-local function extractOpenAI(resBody)
-    local d = JsonDecode(resBody)
+--══════════════════════════════════════════════════════════════════════════════
+-- 6.  MODEL CATALOGS  (live, so dead model ids can't break the script)
+--══════════════════════════════════════════════════════════════════════════════
+local Catalog = {
+    gemini = {
+        state = "idle",     -- idle | loading | ready | error
+        error = nil,
+        list  = {},         -- { { id = "...", label = "...", note = "..." }, ... }
+        selected = Prefs.models.gemini,
+    },
+    openrouter = {
+        state = "idle",
+        error = nil,
+        list  = {},
+        selected = Prefs.models.openrouter,
+    },
+}
+
+local OnCatalogChanged = function() end  -- wired to the GUI later
+
+local function setCatalog(provider, state, err)
+    local cat = Catalog[provider]
+    cat.state = state
+    cat.error = err
+    -- if the live list can't be fetched, fall back to the built-in ids so the
+    -- picker is never an empty screen
+    if state == "error" and #cat.list == 0 then
+        local list = {}
+        for _, id in ipairs(CONFIG[provider].fallback or {}) do
+            list[#list + 1] = { id = id, label = id, note = "built-in" }
+        end
+        cat.list = list
+    end
+    OnCatalogChanged(provider)
+end
+
+-- OpenRouter: GET /api/v1/models -> keep zero-priced, text-output models
+local function FetchOpenRouterModels(verbose)
+    setCatalog("openrouter", "loading")
+    local status, body = HttpCall({
+        Url = CONFIG.openrouter.list,
+        Method = "GET",
+        Headers = {
+            ["Accept"] = "application/json",
+            ["HTTP-Referer"] = "https://github.com",
+            ["X-Title"] = "RobloxAIHelper",
+        },
+    })
+    if status ~= 200 then
+        setCatalog("openrouter", "error", string.format("HTTP %d: %s", status, shortErr(body)))
+        return false
+    end
+    local d = JsonDecode(body)
+    local data = d and (d.data or d.models)
+    if type(data) ~= "table" then
+        setCatalog("openrouter", "error", "unexpected response")
+        return false
+    end
+
+    local list = {}
+    for _, m in ipairs(data) do
+        local id = m.id
+        if type(id) == "string" then
+            local pricing = m.pricing or {}
+            local pin  = tonumber(pricing.prompt or pricing.input or -1)
+            local pout = tonumber(pricing.completion or pricing.output or -1)
+            local free = (pin == 0 and pout == 0)
+
+            local outputs = m.architecture and m.architecture.output_modalities
+            local textOK = true
+            if type(outputs) == "table" then
+                textOK = false
+                for _, mod in ipairs(outputs) do
+                    if tostring(mod):lower() == "text" then textOK = true break end
+                end
+            end
+
+            if free and textOK then
+                local ctx = tonumber(m.context_length or (m.top_provider and m.top_provider.context_length) or 0)
+                list[#list + 1] = {
+                    id    = id,
+                    label = (m.name and tostring(m.name):gsub("%s*%(free%)%s*$", "")) or id,
+                    note  = (ctx > 0) and string.format("%dk ctx", math.floor(ctx / 1000)) or "",
+                }
+            end
+        end
+    end
+
+    table.sort(list, function(a, b) return a.id < b.id end)
+    -- keep the UI snappy and the request short
+    while #list > 80 do table.remove(list) end
+
+    Catalog.openrouter.list = list
+    if #list == 0 then
+        setCatalog("openrouter", "error", "no free models listed right now")
+        return false
+    end
+    setCatalog("openrouter", "ready")
+
+    -- make sure the saved pick still exists
+    local sel = Catalog.openrouter.selected
+    if sel then
+        local keep = false
+        for _, m in ipairs(list) do
+            if m.id == sel then keep = true break end
+        end
+        if not keep then Catalog.openrouter.selected = nil end
+    end
+    if verbose then
+        setCatalog("openrouter", "ready")
+    end
+    return true
+end
+
+-- Gemini: GET /v1beta/models -> keep models that support generateContent
+local function FetchGeminiModels(verbose)
+    setCatalog("gemini", "loading")
+    local key = KEYS.gemini
+    if key == "" then
+        setCatalog("gemini", "error", "no api key")
+        return false
+    end
+
+    local status, body = HttpCall({
+        Url = CONFIG.gemini.list .. "?pageSize=200",
+        Method = "GET",
+        Headers = { ["Accept"] = "application/json", ["x-goog-api-key"] = key },
+    })
+    if status ~= 200 then
+        -- retry once with the legacy query style
+        status, body = HttpCall({
+            Url = CONFIG.gemini.list .. "?pageSize=200&key=" .. UrlEncode(key),
+            Method = "GET",
+            Headers = { ["Accept"] = "application/json" },
+        })
+    end
+    if status ~= 200 then
+        setCatalog("gemini", "error", string.format("HTTP %d: %s", status, shortErr(body)))
+        return false
+    end
+
+    local d = JsonDecode(body)
+    local models = d and d.models
+    if type(models) ~= "table" then
+        setCatalog("gemini", "error", "unexpected response")
+        return false
+    end
+
+    local list = {}
+    for _, m in ipairs(models) do
+        local raw = tostring(m.name or "")
+        local id  = raw:gsub("^models/", "")
+        local methods = m.supportedGenerationMethods or {}
+        local canGenerate = false
+        for _, meth in ipairs(methods) do
+            if meth == "generateContent" then canGenerate = true break end
+        end
+        -- embeddings / vision-only generators are noise here
+        local junk = id:find("embedding", 1, true) or id:find("aqa", 1, true)
+            or id:find("imagen", 1, true) or id:find("veo", 1, true)
+            or id:find("tts", 1, true)
+        if canGenerate and not junk then
+            list[#list + 1] = {
+                id = id,
+                label = (m.displayName and tostring(m.displayName)) or id,
+                note = id,
+            }
+        end
+    end
+
+    table.sort(list, function(a, b) return a.id < b.id end)
+    Catalog.gemini.list = list
+    if #list == 0 then
+        setCatalog("gemini", "error", "this key can't call any model")
+        return false
+    end
+
+    local sel = Catalog.gemini.selected
+    if sel then
+        local keep = false
+        for _, m in ipairs(list) do if m.id == sel then keep = true break end end
+        if not keep then Catalog.gemini.selected = nil end
+    end
+    setCatalog("gemini", "ready")
+    return true
+end
+
+local function FetchAllModels(verbose)
+    task.spawn(function() pcall(FetchOpenRouterModels, verbose) end)
+    task.spawn(function() pcall(FetchGeminiModels, verbose) end)
+end
+
+-- model id ordering for one attempt: picked first, then the rest of the list
+local function ModelOrder(provider, limit)
+    local order, seen = {}, {}
+    local cat = Catalog[provider]
+    local function push(id)
+        if type(id) == "string" and id ~= "" and not seen[id] then
+            seen[id] = true
+            order[#order + 1] = id
+        end
+    end
+
+    push(cat.selected)
+    for _, m in ipairs(cat.list) do push(m.id) end
+    for _, id in ipairs(CONFIG[provider].fallback or {}) do push(id) end
+    if provider == "openrouter" then push("openrouter/free") end
+
+    local capped = {}
+    for i = 1, math.min(#order, limit or 4) do capped[i] = order[i] end
+    return capped
+end
+
+--══════════════════════════════════════════════════════════════════════════════
+-- 7.  PROVIDERS
+--══════════════════════════════════════════════════════════════════════════════
+local function extractOpenAI(body)
+    local d = JsonDecode(body)
     local choice = d and d.choices and d.choices[1]
     local content = choice and choice.message and choice.message.content
     if type(content) == "string" and content ~= "" then return content end
     if d and type(d.content) == "string" and d.content ~= "" then return d.content end
-    if d and d.error then
-        local e = d.error
-        if type(e) == "table" then return nil, tostring(e.message or e.code or "error") end
-        return nil, tostring(e)
-    end
-    return nil, nil
+    return nil
 end
 
--- TokenHarbor ─────────────────────────────────────────────────────────────────
+-- TokenHarbor ────────────────────────────────────────────────────────────────
 local function CallTokenharbor(messages)
     if KEYS.tokenharbor == "" then return nil, "no api key" end
-    local status, resBody = HttpCall({
-        Url     = CONFIG.tokenharbor.url,
-        Method  = "POST",
+    local status, body = HttpCall({
+        Url = CONFIG.tokenharbor.url, Method = "POST",
         Headers = {
-            ["Content-Type"]  = "application/json",
+            ["Content-Type"] = "application/json",
             ["Authorization"] = "Bearer " .. KEYS.tokenharbor,
         },
         Body = JsonEncode({
@@ -336,14 +552,14 @@ local function CallTokenharbor(messages)
         }),
     })
     if status ~= 200 then
-        return nil, string.format("HTTP %d: %s", status, tostring(resBody):sub(1, 160))
+        return nil, string.format("HTTP %d: %s", status, shortErr(body))
     end
-    local reply, apiErr = extractOpenAI(resBody)
-    if not reply then return nil, apiErr or ("empty: " .. tostring(resBody):sub(1, 120)) end
+    local reply = extractOpenAI(body)
+    if not reply then return nil, "empty response" end
     return reply, nil
 end
 
--- Gemini ──────────────────────────────────────────────────────────────────────
+-- Gemini ─────────────────────────────────────────────────────────────────────
 local function messagesToGemini(messages)
     local contents, sysParts = {}, {}
     local function push(role, text)
@@ -363,40 +579,25 @@ local function messagesToGemini(messages)
             push("model", tostring(m.content))
         end
     end
-    while contents[1] and contents[1].role ~= "user" do
-        table.remove(contents, 1)
-    end
+    while contents[1] and contents[1].role ~= "user" do table.remove(contents, 1) end
     return contents, sysParts
 end
 
--- One request to one model. Two auth styles because Google now mints "AQ.…"
--- keys that only work in the header, while legacy "AIza…" keys work either way.
-local function CallGeminiOnce(payload, modelId)
+-- returns reply, err, and whether trying another model could help
+local function CallGeminiModel(payload, modelId)
     local key = KEYS.gemini
-    if key == "" then return nil, "no api key", false end
-
     local base = CONFIG.gemini.base .. modelId .. ":generateContent"
-    local bodyJson = JsonEncode(payload)
+    local body = JsonEncode(payload)
 
     local attempts = {
-        {
-            name    = "header",
-            url     = base,
-            headers = { ["Content-Type"] = "application/json", ["x-goog-api-key"] = key },
-        },
-        {
-            name    = "query",
-            url     = base .. "?key=" .. UrlEncode(key),
-            headers = { ["Content-Type"] = "application/json" },
-        },
+        { url = base, headers = { ["Content-Type"] = "application/json", ["x-goog-api-key"] = key } },
+        { url = base .. "?key=" .. UrlEncode(key), headers = { ["Content-Type"] = "application/json" } },
     }
 
-    local lastErr = "unknown"
-    local authFailed = false
-
+    local lastErr, retryOtherModel = "unknown", false
     for _, at in ipairs(attempts) do
         local status, resBody = HttpCall({
-            Url = at.url, Method = "POST", Headers = at.headers, Body = bodyJson,
+            Url = at.url, Method = "POST", Headers = at.headers, Body = body,
         })
 
         if status == 200 then
@@ -404,36 +605,32 @@ local function CallGeminiOnce(payload, modelId)
             local cand = d and d.candidates and d.candidates[1]
             local text = cand and cand.content and cand.content.parts and cand.content.parts[1]
                 and cand.content.parts[1].text
-            if type(text) == "string" and text ~= "" then
-                return text, nil, false
-            end
+            if type(text) == "string" and text ~= "" then return text, nil, false end
             local reason = (cand and cand.finishReason)
-                or (d and d.promptFeedback and d.promptFeedback.blockReason)
-                or "no candidates"
-            lastErr = "empty (" .. tostring(reason) .. ")"
-            -- model refused / was blocked: another auth style won't change that
-            if reason ~= "no candidates" then return nil, lastErr, true end
-        else
-            local d = JsonDecode(resBody)
-            local msg = d and d.error and (d.error.message or d.error.status)
-            lastErr = string.format("HTTP %d: %s", status,
-                tostring(msg or tostring(resBody):sub(1, 140)))
+                or (d and d.promptFeedback and d.promptFeedback.blockReason) or "no candidates"
+            return nil, "empty (" .. tostring(reason) .. ")", false
+        end
 
-            -- quota exceeded: try the other style once, then give up entirely
-            if status == 429 then return nil, lastErr, true end
-            if status == 400 or status == 401 or status == 403 or status == 404 then
-                authFailed = true
+        lastErr = string.format("HTTP %d: %s", status, shortErr(resBody))
+        if status == 404 then
+            retryOtherModel = true            -- model gone: try the next one
+        elseif status == 429 then
+            return nil, lastErr, false        -- quota: stop hammering
+        elseif status == 400 or status == 401 or status == 403 then
+            local low = lastErr:lower()
+            if low:find("not found", 1, true) or low:find("not supported", 1, true)
+                or low:find("does not exist", 1, true) then
+                retryOtherModel = true
+            else
+                retryOtherModel = false       -- bad key / bad request
             end
-            -- anything else (5xx / network) is worth one more attempt too
         end
     end
-
-    -- both auth styles failed with an auth error -> this key/model is unusable,
-    -- don't burn four more requests on the rest of the model list
-    return nil, lastErr, authFailed
+    return nil, lastErr, retryOtherModel
 end
 
 local function CallGemini(messages)
+    if KEYS.gemini == "" then return nil, "no api key" end
     local contents, sysParts = messagesToGemini(messages)
     if #contents == 0 then return nil, "nothing to send" end
 
@@ -443,58 +640,64 @@ local function CallGemini(messages)
     }
     if #sysParts > 0 then payload.systemInstruction = { parts = sysParts } end
 
-    -- start with the picked model, then fall through the rest (a retired model
-    -- id returns 404 and shouldn't kill the whole provider)
-    local order = {}
-    local n = #CONFIG.gemini.models
-    for i = 0, n - 1 do
-        order[#order + 1] = CONFIG.gemini.models[((selectedGeminiIdx - 1 + i) % n) + 1]
+    local errs = {}
+    for _, id in ipairs(ModelOrder("gemini", 4)) do
+        local text, err, tryMore = CallGeminiModel(payload, id)
+        if text then
+            if not Catalog.gemini.selected then Catalog.gemini.selected = id end
+            return text, nil
+        end
+        errs[#errs + 1] = id .. " → " .. tostring(err)
+        if not tryMore then break end
     end
-
-    local lastErr = "no model tried"
-    for _, model in ipairs(order) do
-        local text, err, fatal = CallGeminiOnce(payload, model.id)
-        if text then return text, nil end
-        lastErr = model.id .. " → " .. tostring(err)
-        if fatal then break end
-    end
-    return nil, lastErr
+    return nil, table.concat(errs, " · ")
 end
 
--- OpenRouter ──────────────────────────────────────────────────────────────────
+-- OpenRouter ─────────────────────────────────────────────────────────────────
+local function CallOpenRouterModel(messages, modelId)
+    local status, body = HttpCall({
+        Url = CONFIG.openrouter.url, Method = "POST",
+        Headers = {
+            ["Content-Type"] = "application/json",
+            ["Authorization"] = "Bearer " .. KEYS.openrouter,
+            ["HTTP-Referer"] = "https://github.com",
+            ["X-Title"] = "RobloxAIHelper",
+        },
+        Body = JsonEncode({ model = modelId, max_tokens = MAX_TOKENS, messages = messages }),
+    })
+    if status == 200 then
+        local reply = extractOpenAI(body)
+        if reply then return reply, nil, false end
+        return nil, "empty response", true
+    end
+    local err = string.format("HTTP %d: %s", status, shortErr(body))
+    if status == 401 or status == 402 or status == 429 then
+        return nil, err, false      -- auth / credits / rate limit: stop
+    end
+    return nil, err, true           -- 404 model retired: try the next one
+end
+
 local function CallOpenRouter(messages)
     if KEYS.openrouter == "" then return nil, "no api key" end
-    local lastErr = "no model tried"
-    for _, modelId in ipairs(CONFIG.openrouter.models) do
-        local status, resBody = HttpCall({
-            Url     = CONFIG.openrouter.url,
-            Method  = "POST",
-            Headers = {
-                ["Content-Type"]  = "application/json",
-                ["Authorization"] = "Bearer " .. KEYS.openrouter,
-                ["HTTP-Referer"]  = "https://github.com",
-                ["X-Title"]       = "RobloxScriptHelper",
-            },
-            Body = JsonEncode({
-                model = modelId, max_tokens = MAX_TOKENS, messages = messages,
-            }),
-        })
-        if status == 200 then
-            local reply = extractOpenAI(resBody)
-            if reply then return reply, nil end
-            lastErr = "empty response for " .. modelId
-        else
-            lastErr = string.format("HTTP %d (%s): %s",
-                status, modelId, tostring(resBody):sub(1, 140))
-            if status == 401 or status == 402 or status == 429 then break end
+    local errs = {}
+    local tried = 0
+    for _, id in ipairs(ModelOrder("openrouter", 4)) do
+        tried = tried + 1
+        local reply, err, tryMore = CallOpenRouterModel(messages, id)
+        if reply then
+            if not Catalog.openrouter.selected then Catalog.openrouter.selected = id end
+            return reply, nil
         end
+        errs[#errs + 1] = id .. " → " .. tostring(err)
+        if not tryMore then break end
     end
-    return nil, lastErr
+    if tried == 1 and #errs == 1 then return nil, errs[1] end
+    return nil, table.concat(errs, " · ")
 end
 
--- ══════════════════════════════════════════════════════════════════════════════
--- 5.  CHAT HISTORY + UNIFIED ASK
--- ══════════════════════════════════════════════════════════════════════════════
+--══════════════════════════════════════════════════════════════════════════════
+-- 8.  CHAT + UNIFIED ASK
+--══════════════════════════════════════════════════════════════════════════════
 local ChatHistory = {}
 
 local SYSTEM_PROMPT = table.concat({
@@ -520,53 +723,71 @@ local function BuildMessages(userMsg, gameCtx)
     return messages
 end
 
-local activeProvider = "tokenharbor"
+local activeProvider = nil
 
+-- returns reply, provider, summaryTable
 local function AskAI(userMsg, gameCtx, logFn, noHistory)
     logFn = logFn or function() end
     local messages = BuildMessages(userMsg, gameCtx)
+    local failures = {}
     local reply, err
 
-    logFn("⏳ tokenharbor…", Color3.fromRGB(140, 140, 180))
-    reply, err = CallTokenharbor(messages)
-    if reply then
-        activeProvider = "tokenharbor"
-    else
-        logFn("⚠ tokenharbor: " .. tostring(err), Color3.fromRGB(210, 150, 50))
-        local label = (CONFIG.gemini.models[selectedGeminiIdx] or CONFIG.gemini.models[1]).label
-        logFn("⏳ gemini (" .. label .. ")…", Color3.fromRGB(140, 200, 140))
-        reply, err = CallGemini(messages)
-        if reply then
-            activeProvider = "gemini"
+    local steps = {
+        {
+            name = "tokenharbor",
+            run  = CallTokenharbor,
+            color = Color3.fromRGB(94, 234, 168),
+        },
+        {
+            name = "gemini",
+            run  = CallGemini,
+            color = Color3.fromRGB(120, 190, 255),
+        },
+        {
+            name = "openrouter",
+            run  = CallOpenRouter,
+            color = Color3.fromRGB(255, 176, 112),
+        },
+    }
+
+    for _, step in ipairs(steps) do
+        local keyMissing =
+            (step.name == "tokenharbor" and KEYS.tokenharbor == "") or
+            (step.name == "gemini"     and KEYS.gemini == "")     or
+            (step.name == "openrouter" and KEYS.openrouter == "")
+
+        if keyMissing then
+            failures[#failures + 1] = { name = step.name, err = "no api key" }
         else
-            logFn("⚠ gemini: " .. tostring(err), Color3.fromRGB(210, 150, 50))
-            logFn("⏳ openrouter…", Color3.fromRGB(140, 180, 220))
-            reply, err = CallOpenRouter(messages)
-            if reply then
-                activeProvider = "openrouter"
-            else
-                logFn("❌ openrouter: " .. tostring(err), Color3.fromRGB(220, 70, 70))
+            logFn("· " .. step.name .. "…", step.color)
+            local ok, r, e = pcall(step.run, messages)
+            if ok and r then
+                reply, err = r, nil
+                activeProvider = step.name
+                -- if this provider used a different model than the pick, remember it
+                break
             end
+            err = ok and e or ("error: " .. tostring(r))
+            failures[#failures + 1] = { name = step.name, err = tostring(err) }
         end
     end
 
-    if not reply then return nil, nil, tostring(err or "unknown error") end
+    if not reply then return nil, nil, failures end
 
     if not noHistory then
         ChatHistory[#ChatHistory + 1] = { role = "user", content = userMsg }
         ChatHistory[#ChatHistory + 1] = { role = "assistant", content = reply }
         while #ChatHistory > MAX_CTX * 2 do table.remove(ChatHistory, 1) end
     end
-    return reply, activeProvider, nil
+    return reply, activeProvider, failures
 end
 
--- ══════════════════════════════════════════════════════════════════════════════
--- 6.  CODE EXTRACTION + EXECUTION
--- ══════════════════════════════════════════════════════════════════════════════
+--══════════════════════════════════════════════════════════════════════════════
+-- 9.  CODE EXTRACTION + EXECUTION
+--══════════════════════════════════════════════════════════════════════════════
 local function trimBlanks(s)
     s = tostring(s or "")
-    s = s:gsub("^%s*\n", "")
-    s = s:gsub("%s+$", "")
+    s = s:gsub("^%s*\n", ""):gsub("%s+$", "")
     return s
 end
 
@@ -634,15 +855,11 @@ end
 
 local LOADER = getLoader()
 
--- Compile first (syntax errors surface immediately), then run on its own
--- thread so generated code can yield / loop without freezing the panel.
 local function ExecScript(code, onError)
     if not code or code == "" then return false, "no code to run" end
-    if not LOADER then return false, "loadstring is not available in this executor" end
-
+    if not LOADER then return false, "loadstring isn't available in this executor" end
     local fn, compileErr = LOADER(code)
     if not fn then return false, "compile error: " .. tostring(compileErr) end
-
     task.spawn(function()
         local ok, runtimeErr = pcall(fn)
         if not ok and onError then onError(runtimeErr) end
@@ -650,9 +867,170 @@ local function ExecScript(code, onError)
     return true, nil
 end
 
--- ══════════════════════════════════════════════════════════════════════════════
--- 7.  GUI  (compact, responsive, draggable — built for phones)
--- ══════════════════════════════════════════════════════════════════════════════
+--══════════════════════════════════════════════════════════════════════════════
+-- 10.  THEME
+--══════════════════════════════════════════════════════════════════════════════
+local THEME = {
+    -- surfaces
+    bgTop      = Color3.fromRGB(27, 25, 48),
+    bgBottom   = Color3.fromRGB(16, 16, 30),
+    card       = Color3.fromRGB(33, 32, 57),
+    cardAlt    = Color3.fromRGB(40, 39, 70),
+    well       = Color3.fromRGB(15, 15, 27),
+    stroke     = Color3.fromRGB(64, 62, 108),
+    strokeSoft = Color3.fromRGB(48, 46, 82),
+
+    -- accents
+    violet     = Color3.fromRGB(150, 122, 255),
+    violetDeep = Color3.fromRGB(112, 84, 226),
+    cyan       = Color3.fromRGB(96, 214, 255),
+    pink       = Color3.fromRGB(255, 128, 190),
+    mint       = Color3.fromRGB(94, 234, 168),
+    amber      = Color3.fromRGB(255, 196, 92),
+    coral      = Color3.fromRGB(255, 118, 118),
+
+    -- text
+    text       = Color3.fromRGB(238, 240, 252),
+    textDim    = Color3.fromRGB(166, 170, 204),
+    textFaint  = Color3.fromRGB(112, 116, 152),
+}
+
+local FONT       = Enum.Font.Gotham
+local FONT_MED   = Enum.Font.GothamMedium
+local FONT_BOLD  = Enum.Font.GothamBold
+local FONT_MONO  = Enum.Font.Code
+
+--══════════════════════════════════════════════════════════════════════════════
+-- 11.  GUI HELPERS
+--══════════════════════════════════════════════════════════════════════════════
+local function corner(obj, r)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, r or 8)
+    c.Parent = obj
+    return c
+end
+
+local function stroke(obj, thickness, color, transparency)
+    local s = Instance.new("UIStroke")
+    s.Thickness = thickness or 1
+    s.Color = color or THEME.strokeSoft
+    s.Transparency = transparency or 0
+    s.Parent = obj
+    return s
+end
+
+local function gradient(obj, from, to, rotation)
+    local g = Instance.new("UIGradient")
+    g.Color = ColorSequence.new(from, to)
+    g.Rotation = rotation or 90
+    g.Parent = obj
+    return g
+end
+
+local function pad(obj, l, r, t, b)
+    local p = Instance.new("UIPadding")
+    p.PaddingLeft = UDim.new(0, l or 0)
+    p.PaddingRight = UDim.new(0, r or l or 0)
+    p.PaddingTop = UDim.new(0, t or 0)
+    p.PaddingBottom = UDim.new(0, b or t or 0)
+    p.Parent = obj
+    return p
+end
+
+local function label(parent, text, size, color, font, textSize, xAlign)
+    local l = Instance.new("TextLabel")
+    l.Text = text
+    l.Size = size
+    l.BackgroundTransparency = 1
+    l.TextColor3 = color or THEME.text
+    l.Font = font or FONT
+    l.TextSize = textSize or 11
+    l.TextXAlignment = xAlign or Enum.TextXAlignment.Left
+    l.RichText = false
+    l.Parent = parent
+    return l
+end
+
+-- hover / press feedback for buttons
+local function addButtonFeel(btn, baseColor, hoverColor, pressColor)
+    btn.BackgroundColor3 = baseColor
+    btn.AutoButtonColor = false
+    btn.MouseEnter:Connect(function()
+        if btn:GetAttribute("lock") ~= true then
+            TweenService:Create(btn, TweenInfo.new(0.12), { BackgroundColor3 = hoverColor }):Play()
+        end
+    end)
+    btn.MouseLeave:Connect(function()
+        if btn:GetAttribute("lock") ~= true then
+            TweenService:Create(btn, TweenInfo.new(0.16), { BackgroundColor3 = baseColor }):Play()
+        end
+    end)
+    btn.MouseButton1Down:Connect(function()
+        TweenService:Create(btn, TweenInfo.new(0.05), { BackgroundColor3 = pressColor }):Play()
+    end)
+    btn.MouseButton1Up:Connect(function()
+        TweenService:Create(btn, TweenInfo.new(0.12), { BackgroundColor3 = hoverColor }):Play()
+    end)
+    btn:SetAttribute("baseColor", baseColor)
+end
+
+local function screenSize()
+    local cam = workspace.CurrentCamera
+    local ok, vp = pcall(function() return cam.ViewportSize end)
+    if ok and vp and vp.X > 0 and vp.Y > 0 then return vp end
+    return Vector2.new(800, 600)
+end
+
+local function sizePx(frame)
+    local a = frame.AbsoluteSize
+    local w = (a and a.X > 0) and a.X or frame.Size.X.Offset
+    local h = (a and a.Y > 0) and a.Y or frame.Size.Y.Offset
+    return w, h
+end
+
+local function clampTo(x, y, w, h)
+    local vp = screenSize()
+    return math.clamp(x, 0, math.max(0, vp.X - w)), math.clamp(y, 0, math.max(0, vp.Y - h))
+end
+
+local function makeDraggable(frame, handle)
+    local dragging, dragStart, startPos = false, nil, nil
+    local moved, movedAt = false, 0
+
+    handle.InputBegan:Connect(function(input)
+        local t = input.UserInputType
+        if t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.Touch then
+            dragging, moved = true, false
+            dragStart, startPos = input.Position, frame.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                    if moved then movedAt = os.clock() end
+                end
+            end)
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if not dragging then return end
+        local t = input.UserInputType
+        if t == Enum.UserInputType.MouseMovement or t == Enum.UserInputType.Touch then
+            local delta = input.Position - dragStart
+            if math.abs(delta.X) + math.abs(delta.Y) > 6 then moved = true end
+            local w, h = sizePx(frame)
+            local nx, ny = clampTo(startPos.X.Offset + delta.X, startPos.Y.Offset + delta.Y, w, h)
+            frame.Position = UDim2.new(0, nx, 0, ny)
+        end
+    end)
+
+    return function()
+        return moved and (os.clock() - movedAt) < 0.3
+    end
+end
+
+--══════════════════════════════════════════════════════════════════════════════
+-- 12.  ROOT GUI
+--══════════════════════════════════════════════════════════════════════════════
 local function guiParentCandidates()
     local list = {}
     local ok, core = pcall(function() return game:GetService("CoreGui") end)
@@ -680,484 +1058,393 @@ for _, parent in ipairs(guiParentCandidates()) do
     if ok and SG.Parent ~= nil then parented = true break end
 end
 if not parented then
-    Notify("AI Helper", "Could not create the GUI — CoreGui/PlayerGui blocked.", 8)
+    Notify("AI Helper", "Couldn't create the panel — CoreGui/PlayerGui blocked.", 8)
     return
 end
 
-local function corner(obj, r)
-    local c = Instance.new("UICorner")
-    c.CornerRadius = UDim.new(0, r or 6)
-    c.Parent = obj
-    return c
-end
-
-local function stroke(obj, thickness, color)
-    local s = Instance.new("UIStroke")
-    s.Thickness = thickness or 1
-    s.Color = color or Color3.fromRGB(50, 50, 80)
-    s.Parent = obj
-    return s
-end
-
--- ── screen metrics ───────────────────────────────────────────────────────────
-local function screenSize()
-    local cam = workspace.CurrentCamera
-    local ok, vp = pcall(function() return cam.ViewportSize end)
-    if ok and vp and vp.X > 0 and vp.Y > 0 then return vp end
-    return Vector2.new(800, 600)
-end
-
-local function sizePx(frame)
-    local a = frame.AbsoluteSize
-    local w = (a and a.X > 0) and a.X or frame.Size.X.Offset
-    local h = (a and a.Y > 0) and a.Y or frame.Size.Y.Offset
-    return w, h
-end
-
--- keep the whole window on screen
-local function clampTo(x, y, w, h)
-    local vp = screenSize()
-    local maxX = math.max(0, vp.X - w)
-    local maxY = math.max(0, vp.Y - h)
-    return math.clamp(x, 0, maxX), math.clamp(y, 0, maxY)
-end
-
--- touch + mouse drag, clamped, no global state shared between windows
--- touch + mouse drag, clamped so nothing can be lost off-screen.
--- Returns a predicate telling you whether a drag just ended, so a drag on the
--- bubble isn't also treated as a tap (which would toggle the panel by accident).
-local function makeDraggable(frame, handle)
-    local dragging, dragStart, startPos = false, nil, nil
-    local moved, movedAt = false, 0
-
-    handle.InputBegan:Connect(function(input)
-        local t = input.UserInputType
-        if t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.Touch then
-            dragging  = true
-            moved     = false
-            dragStart = input.Position
-            startPos  = frame.Position
-            input.Changed:Connect(function()
-                if input.UserInputState == Enum.UserInputState.End then
-                    dragging = false
-                    if moved then movedAt = os.clock() end
-                end
-            end)
-        end
-    end)
-
-    UserInputService.InputChanged:Connect(function(input)
-        if not dragging then return end
-        local t = input.UserInputType
-        if t == Enum.UserInputType.MouseMovement or t == Enum.UserInputType.Touch then
-            local delta = input.Position - dragStart
-            if math.abs(delta.X) + math.abs(delta.Y) > 6 then moved = true end
-            local w, h  = sizePx(frame)
-            local nx, ny = clampTo(startPos.X.Offset + delta.X, startPos.Y.Offset + delta.Y, w, h)
-            frame.Position = UDim2.new(0, nx, 0, ny)
-        end
-    end)
-
-    return function()
-        return moved and (os.clock() - movedAt) < 0.3
-    end
-end
-
--- ── toggle bubble ────────────────────────────────────────────────────────────
+--────────────────────────────────────────────── floating bubble
 local Bubble = Instance.new("TextButton")
-Bubble.Size = UDim2.new(0, 40, 0, 40)
-Bubble.BackgroundColor3 = Color3.fromRGB(14, 14, 24)
-Bubble.Text = "🤖"
-Bubble.TextSize = 19
-Bubble.Font = Enum.Font.GothamBold
-Bubble.TextColor3 = Color3.fromRGB(255, 255, 255)
-Bubble.ZIndex = 10
+Bubble.Size = UDim2.new(0, 44, 0, 44)
+Bubble.BackgroundColor3 = THEME.card
+Bubble.Text = ""
+Bubble.ZIndex = 20
 Bubble.Parent = SG
-corner(Bubble, 20)
-stroke(Bubble, 1.5, Color3.fromRGB(80, 80, 160))
+corner(Bubble, 22)
+stroke(Bubble, 1.5, THEME.violet, 0.25)
+gradient(Bubble, THEME.violetDeep, THEME.bgBottom, 115)
 do
     local vp = screenSize()
-    local _, y = clampTo(0, math.floor(vp.Y * 0.42), 40, 40)
-    Bubble.Position = UDim2.new(0, 8, 0, y)
+    local _, y = clampTo(0, math.floor(vp.Y * 0.40), 44, 44)
+    Bubble.Position = UDim2.new(0, 10, 0, y)
 end
+
+local BubbleIcon = label(Bubble, "✦", UDim2.new(1, 0, 1, -2), THEME.text, FONT_BOLD, 20,
+    Enum.TextXAlignment.Center)
+BubbleIcon.TextYAlignment = Enum.TextYAlignment.Center
+BubbleIcon.ZIndex = 21
+
 local bubbleDragEnded = makeDraggable(Bubble, Bubble)
 
--- ── panel ────────────────────────────────────────────────────────────────────
-local panelW, panelH = 300, 420
+--────────────────────────────────────────────── panel shell
+local panelW, panelH = 312, 452
 
 local Panel = Instance.new("Frame")
-Panel.BackgroundColor3 = Color3.fromRGB(10, 10, 18)
+Panel.BackgroundColor3 = THEME.bgTop
 Panel.Visible = false
 Panel.ZIndex = 5
 Panel.Parent = SG
-corner(Panel, 10)
-stroke(Panel, 1, Color3.fromRGB(40, 40, 70))
+corner(Panel, 14)
+stroke(Panel, 1, THEME.stroke, 0.35)
+gradient(Panel, THEME.bgTop, THEME.bgBottom, 90)
 
 Bubble.MouseButton1Click:Connect(function()
-    if bubbleDragEnded() then return end -- that was a drag, not a tap
+    if bubbleDragEnded() then return end
     Panel.Visible = not Panel.Visible
+    if Panel.Visible then
+        local vp = screenSize()
+        local w, h = sizePx(Panel)
+        local x, y = clampTo(Panel.Position.X.Offset, Panel.Position.Y.Offset, w, h)
+        Panel.Position = UDim2.new(0, x, 0, y)
+    end
 end)
 
--- ── title bar ────────────────────────────────────────────────────────────────
-local TBar = Instance.new("Frame")
-TBar.Size = UDim2.new(1, 0, 0, 30)
-TBar.BackgroundColor3 = Color3.fromRGB(14, 14, 26)
-TBar.ZIndex = 6
-TBar.Parent = Panel
-corner(TBar, 10)
-makeDraggable(Panel, TBar)
+--────────────────────────────────────────────── header
+local Header = Instance.new("Frame")
+Header.BackgroundTransparency = 1
+Header.ZIndex = 6
+Header.Parent = Panel
 
-local TLbl = Instance.new("TextLabel")
-TLbl.Text = "🤖  AI Helper"
-TLbl.Size = UDim2.new(1, -66, 1, 0)
-TLbl.Position = UDim2.new(0, 8, 0, 0)
-TLbl.BackgroundTransparency = 1
-TLbl.TextColor3 = Color3.fromRGB(110, 160, 255)
-TLbl.Font = Enum.Font.GothamBold
-TLbl.TextSize = 11
-TLbl.TextXAlignment = Enum.TextXAlignment.Left
-TLbl.ZIndex = 7
-TLbl.Parent = TBar
+local HeaderAccent = Instance.new("Frame")
+HeaderAccent.Size = UDim2.new(0, 3, 0, 20)
+HeaderAccent.Position = UDim2.new(0, 14, 0, 14)
+HeaderAccent.BackgroundColor3 = THEME.violet
+HeaderAccent.BorderSizePixel = 0
+HeaderAccent.ZIndex = 7
+HeaderAccent.Parent = Header
+corner(HeaderAccent, 2)
+gradient(HeaderAccent, THEME.violet, THEME.cyan, 90)
 
-local function titleButton(text, xOffset, bg, size)
+local TitleLbl = label(Header, "AI Helper", UDim2.new(0, 150, 0, 16), THEME.text, FONT_BOLD, 14)
+TitleLbl.Position = UDim2.new(0, 24, 0, 10)
+TitleLbl.ZIndex = 7
+
+local SubLbl = label(Header, "roblox copilot", UDim2.new(0, 150, 0, 12), THEME.textFaint, FONT_MED, 9)
+SubLbl.Position = UDim2.new(0, 25, 0, 25)
+SubLbl.ZIndex = 7
+
+local function headerButton(icon, xOffset, tint)
     local b = Instance.new("TextButton")
-    size = size or 22
-    b.Size = UDim2.new(0, size, 0, size)
-    b.Position = UDim2.new(1, xOffset, 0.5, -size / 2)
-    b.BackgroundColor3 = bg
-    b.Text = text
-    b.Font = Enum.Font.GothamBold
-    b.TextColor3 = Color3.fromRGB(255, 255, 255)
-    b.TextSize = 10
+    b.Size = UDim2.new(0, 28, 0, 28)
+    b.Position = UDim2.new(1, xOffset, 0, 9)
+    b.BackgroundColor3 = THEME.card
+    b.Text = icon
+    b.Font = FONT_BOLD
+    b.TextColor3 = tint or THEME.textDim
+    b.TextSize = 12
     b.ZIndex = 7
-    b.Parent = TBar
-    corner(b, 4)
+    b.Parent = Header
+    corner(b, 9)
+    stroke(b, 1, THEME.strokeSoft, 0.2)
+    addButtonFeel(b, THEME.card, THEME.cardAlt, THEME.strokeSoft)
     return b
 end
 
-local SettingsBtn = titleButton("⚙", -54, Color3.fromRGB(45, 45, 75))
-local XBtn        = titleButton("✕", -28, Color3.fromRGB(180, 40, 40))
-XBtn.MouseButton1Click:Connect(function() Panel.Visible = false end)
+local SettingsBtn = headerButton("⚙", -70, THEME.textDim)
+local CloseBtn    = headerButton("✕", -36, THEME.coral)
+CloseBtn.MouseButton1Click:Connect(function() Panel.Visible = false end)
 
--- ── provider badge ───────────────────────────────────────────────────────────
-local ProvBadge = Instance.new("TextLabel")
-ProvBadge.BackgroundColor3 = Color3.fromRGB(20, 20, 35)
-ProvBadge.TextColor3 = Color3.fromRGB(120, 120, 180)
-ProvBadge.Font = Enum.Font.Code
-ProvBadge.TextSize = 8
-ProvBadge.TextXAlignment = Enum.TextXAlignment.Left
-ProvBadge.Text = "  provider: not connected"
-ProvBadge.ZIndex = 6
-ProvBadge.Parent = Panel
-corner(ProvBadge, 4)
+--────────────────────────────────────────────── status strip
+local StatusRow = Instance.new("Frame")
+StatusRow.BackgroundColor3 = THEME.card
+StatusRow.ZIndex = 6
+StatusRow.Parent = Panel
+corner(StatusRow, 8)
+stroke(StatusRow, 1, THEME.strokeSoft, 0.55)
 
-local function SetProvBadge(name)
-    local colors = {
-        tokenharbor = Color3.fromRGB(60, 200, 120),
-        gemini      = Color3.fromRGB(80, 180, 255),
-        openrouter  = Color3.fromRGB(200, 140, 60),
-    }
-    ProvBadge.TextColor3 = colors[name] or Color3.fromRGB(180, 180, 180)
-    ProvBadge.Text = "  ✦ " .. tostring(name) ..
-        (HTTP_SOURCE and ("   ·   http: " .. HTTP_SOURCE) or "   ·   http: missing")
-end
+local StatusDot = Instance.new("Frame")
+StatusDot.Size = UDim2.new(0, 6, 0, 6)
+StatusDot.Position = UDim2.new(0, 9, 0.5, -3)
+StatusDot.BackgroundColor3 = THEME.amber
+StatusDot.BorderSizePixel = 0
+StatusDot.ZIndex = 7
+StatusDot.Parent = StatusRow
+corner(StatusDot, 3)
 
--- ── gemini model picker ──────────────────────────────────────────────────────
-local PickerFrame = Instance.new("Frame")
-PickerFrame.BackgroundColor3 = Color3.fromRGB(16, 16, 30)
-PickerFrame.ZIndex = 6
-PickerFrame.Parent = Panel
-corner(PickerFrame, 4)
-stroke(PickerFrame, 1, Color3.fromRGB(40, 60, 100))
-
-local PickerLbl = Instance.new("TextLabel")
-PickerLbl.Size = UDim2.new(0, 42, 1, 0)
-PickerLbl.Position = UDim2.new(0, 4, 0, 0)
-PickerLbl.BackgroundTransparency = 1
-PickerLbl.Text = "gemini"
-PickerLbl.TextColor3 = Color3.fromRGB(80, 120, 180)
-PickerLbl.Font = Enum.Font.Code
-PickerLbl.TextSize = 8
-PickerLbl.TextXAlignment = Enum.TextXAlignment.Left
-PickerLbl.ZIndex = 7
-PickerLbl.Parent = PickerFrame
-
-local PickerBtn = Instance.new("TextButton")
-PickerBtn.Size = UDim2.new(1, -48, 1, 0)
-PickerBtn.Position = UDim2.new(0, 44, 0, 0)
-PickerBtn.BackgroundColor3 = Color3.fromRGB(22, 22, 40)
-PickerBtn.Text = (CONFIG.gemini.models[selectedGeminiIdx]).label
-PickerBtn.TextColor3 = Color3.fromRGB(160, 210, 255)
-PickerBtn.Font = Enum.Font.Code
-PickerBtn.TextSize = 8
-PickerBtn.TextTruncate = Enum.TextTruncate.AtEnd
-PickerBtn.ZIndex = 7
-PickerBtn.Parent = PickerFrame
-corner(PickerBtn, 3)
-
-local Dropdown = Instance.new("Frame")
-Dropdown.Size = UDim2.new(0, 170, 0, #CONFIG.gemini.models * 20 + 6)
-Dropdown.BackgroundColor3 = Color3.fromRGB(18, 18, 32)
-Dropdown.Visible = false
-Dropdown.ZIndex = 30
-Dropdown.Parent = Panel
-corner(Dropdown, 5)
-stroke(Dropdown, 1, Color3.fromRGB(60, 80, 140))
-
-local DDLayout = Instance.new("UIListLayout")
-DDLayout.SortOrder = Enum.SortOrder.LayoutOrder
-DDLayout.Padding = UDim.new(0, 1)
-DDLayout.Parent = Dropdown
-
-local DDPad = Instance.new("UIPadding")
-DDPad.PaddingLeft = UDim.new(0, 3)
-DDPad.PaddingRight = UDim.new(0, 3)
-DDPad.PaddingTop = UDim.new(0, 3)
-DDPad.PaddingBottom = UDim.new(0, 3)
-DDPad.Parent = Dropdown
-
-for i, m in ipairs(CONFIG.gemini.models) do
-    local row = Instance.new("TextButton")
-    row.Size = UDim2.new(1, 0, 0, 18)
-    row.LayoutOrder = i
-    row.BackgroundColor3 = Color3.fromRGB(26, 26, 44)
-    row.Text = m.label
-    row.Font = Enum.Font.Code
-    row.TextSize = 8
-    row.TextColor3 = Color3.fromRGB(180, 220, 255)
-    row.TextXAlignment = Enum.TextXAlignment.Left
-    row.ZIndex = 31
-    row.Parent = Dropdown
-    corner(row, 3)
-    local rp = Instance.new("UIPadding")
-    rp.PaddingLeft = UDim.new(0, 4)
-    rp.Parent = row
-    row.MouseButton1Click:Connect(function()
-        selectedGeminiIdx = i
-        PickerBtn.Text = m.label
-        Dropdown.Visible = false
-    end)
-end
-
-PickerBtn.MouseButton1Click:Connect(function()
-    Dropdown.Visible = not Dropdown.Visible
-end)
-
--- ── status pill ──────────────────────────────────────────────────────────────
-local StatusBar = Instance.new("Frame")
-StatusBar.BackgroundColor3 = Color3.fromRGB(16, 16, 28)
-StatusBar.ZIndex = 6
-StatusBar.Parent = Panel
-corner(StatusBar, 4)
-
-local StatusLbl = Instance.new("TextLabel")
-StatusLbl.Text = "⏳ starting…"
-StatusLbl.Size = UDim2.new(1, -8, 1, 0)
-StatusLbl.Position = UDim2.new(0, 5, 0, 0)
-StatusLbl.BackgroundTransparency = 1
-StatusLbl.TextColor3 = Color3.fromRGB(140, 140, 180)
-StatusLbl.Font = Enum.Font.Code
-StatusLbl.TextSize = 8
-StatusLbl.TextXAlignment = Enum.TextXAlignment.Left
+local StatusLbl = label(StatusRow, "starting…", UDim2.new(1, -34, 1, 0), THEME.textDim, FONT_MED, 10)
+StatusLbl.Position = UDim2.new(0, 21, 0, 0)
 StatusLbl.TextTruncate = Enum.TextTruncate.AtEnd
 StatusLbl.ZIndex = 7
-StatusLbl.Parent = StatusBar
 
--- ── log ──────────────────────────────────────────────────────────────────────
-local OutScroll = Instance.new("ScrollingFrame")
-OutScroll.BackgroundColor3 = Color3.fromRGB(7, 7, 13)
-OutScroll.BorderSizePixel = 0
-OutScroll.ScrollBarThickness = 3
-OutScroll.ScrollBarImageColor3 = Color3.fromRGB(60, 60, 110)
-OutScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
-OutScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
-OutScroll.ZIndex = 6
-OutScroll.Parent = Panel
-corner(OutScroll, 6)
-stroke(OutScroll, 1, Color3.fromRGB(25, 25, 45))
+local HttpLbl = label(StatusRow, "", UDim2.new(0, 0, 1, 0), THEME.textFaint, FONT_MONO, 8,
+    Enum.TextXAlignment.Right)
+HttpLbl.Position = UDim2.new(1, -96, 0, 0)
+HttpLbl.Size = UDim2.new(0, 90, 1, 0)
+HttpLbl.TextTruncate = Enum.TextTruncate.AtEnd
+HttpLbl.ZIndex = 7
+HttpLbl.Text = HTTP_SOURCE and ("via " .. HTTP_SOURCE) or "no http"
 
-local OP = Instance.new("UIPadding")
-OP.PaddingLeft = UDim.new(0, 4)
-OP.PaddingRight = UDim.new(0, 4)
-OP.PaddingTop = UDim.new(0, 3)
-OP.PaddingBottom = UDim.new(0, 3)
-OP.Parent = OutScroll
+local function setStatus(text, color, dotColor)
+    StatusLbl.Text = text
+    StatusLbl.TextColor3 = color or THEME.textDim
+    if dotColor then StatusDot.BackgroundColor3 = dotColor end
+end
 
-local OL = Instance.new("UIListLayout")
-OL.SortOrder = Enum.SortOrder.LayoutOrder
-OL.Padding = UDim.new(0, 1)
-OL.Parent = OutScroll
+--────────────────────────────────────────────── model chips
+local ChipsRow = Instance.new("Frame")
+ChipsRow.BackgroundTransparency = 1
+ChipsRow.ZIndex = 6
+ChipsRow.Parent = Panel
 
-local lineCount, MAX_LINES = 0, 250
+local function makeChip(order, accent)
+    local chip = Instance.new("TextButton")
+    chip.BackgroundColor3 = THEME.card
+    chip.Text = ""
+    chip.LayoutOrder = order
+    chip.ZIndex = 6
+    chip.Parent = ChipsRow
+    corner(chip, 8)
+    stroke(chip, 1, THEME.strokeSoft, 0.4)
 
-local function Log(text, col)
-    col = col or Color3.fromRGB(200, 200, 210)
+    local dot = Instance.new("Frame")
+    dot.Size = UDim2.new(0, 5, 0, 5)
+    dot.Position = UDim2.new(0, 8, 0.5, -2.5)
+    dot.BackgroundColor3 = accent
+    dot.BorderSizePixel = 0
+    dot.ZIndex = 7
+    dot.Parent = chip
+    corner(dot, 3)
+
+    local name = label(chip, "", UDim2.new(1, -20, 0, 10), THEME.textFaint, FONT_MED, 8)
+    name.Position = UDim2.new(0, 17, 0, 5)
+    name.ZIndex = 7
+
+    local value = label(chip, "", UDim2.new(1, -20, 0, 12), THEME.text, FONT_MONO, 9)
+    value.Position = UDim2.new(0, 17, 0, 16)
+    value.TextTruncate = Enum.TextTruncate.AtEnd
+    value.ZIndex = 7
+
+    addButtonFeel(chip, THEME.card, THEME.cardAlt, THEME.strokeSoft)
+    return chip, name, value
+end
+
+local GemChip, GemName, GemValue = makeChip(1, THEME.cyan)
+GemName.Text = "gemini"
+GemValue.Text = "pick a model"
+
+local OrChip, OrName, OrValue = makeChip(2, THEME.amber)
+OrName.Text = "openrouter"
+OrValue.Text = "loading…"
+
+local ChipsLayout = Instance.new("UIListLayout")
+ChipsLayout.FillDirection = Enum.FillDirection.Horizontal
+ChipsLayout.SortOrder = Enum.SortOrder.LayoutOrder
+ChipsLayout.Padding = UDim.new(0, 6)
+ChipsLayout.Parent = ChipsRow
+
+--────────────────────────────────────────────── log
+local LogScroll = Instance.new("ScrollingFrame")
+LogScroll.BackgroundColor3 = THEME.well
+LogScroll.BorderSizePixel = 0
+LogScroll.ScrollBarThickness = 3
+LogScroll.ScrollBarImageColor3 = THEME.stroke
+LogScroll.ScrollBarImageTransparency = 0.35
+LogScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+LogScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+LogScroll.ZIndex = 6
+LogScroll.Parent = Panel
+corner(LogScroll, 10)
+stroke(LogScroll, 1, THEME.strokeSoft, 0.6)
+pad(LogScroll, 8, 8, 8, 8)
+
+local LogList = Instance.new("UIListLayout")
+LogList.SortOrder = Enum.SortOrder.LayoutOrder
+LogList.Padding = UDim.new(0, 4)
+LogList.Parent = LogScroll
+
+local logLines, MAX_LINES = 0, 220
+
+local function Log(text, color)
     local str = tostring(text)
-    if #str > 1200 then str = str:sub(1, 1200) .. " …" end
-    lineCount = lineCount + 1
-    local lbl = Instance.new("TextLabel")
-    lbl.Text = str
-    lbl.Size = UDim2.new(1, 0, 0, 0)
-    lbl.AutomaticSize = Enum.AutomaticSize.Y
-    lbl.BackgroundTransparency = 1
-    lbl.TextColor3 = col
-    lbl.Font = Enum.Font.Code
-    lbl.TextSize = 9
-    lbl.TextWrapped = true
-    lbl.TextXAlignment = Enum.TextXAlignment.Left
-    lbl.LayoutOrder = lineCount
-    lbl.ZIndex = 7
-    lbl.Parent = OutScroll
+    if #str > 900 then str = str:sub(1, 900) .. " …" end
+    logLines = logLines + 1
+    local l = Instance.new("TextLabel")
+    l.Text = str
+    l.Size = UDim2.new(1, 0, 0, 0)
+    l.AutomaticSize = Enum.AutomaticSize.Y
+    l.BackgroundTransparency = 1
+    l.TextColor3 = color or THEME.text
+    l.Font = FONT_MONO
+    l.TextSize = 10
+    l.TextWrapped = true
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    l.LineHeight = 1.1
+    l.LayoutOrder = logLines
+    l.ZIndex = 7
+    l.Parent = LogScroll
     task.defer(function()
-        if OutScroll then OutScroll.CanvasPosition = Vector2.new(0, 1e6) end
+        if LogScroll then LogScroll.CanvasPosition = Vector2.new(0, 1e6) end
     end)
-    if lineCount % 25 == 0 then
-        local labels = {}
-        for _, c in ipairs(OutScroll:GetChildren()) do
-            if c:IsA("TextLabel") then labels[#labels + 1] = c end
+    if logLines % 20 == 0 then
+        local kids = {}
+        for _, c in ipairs(LogScroll:GetChildren()) do
+            if c:IsA("TextLabel") then kids[#kids + 1] = c end
         end
-        if #labels > MAX_LINES then
-            table.sort(labels, function(a, b) return a.LayoutOrder < b.LayoutOrder end)
-            for i = 1, #labels - MAX_LINES do labels[i]:Destroy() end
+        if #kids > MAX_LINES then
+            table.sort(kids, function(a, b) return a.LayoutOrder < b.LayoutOrder end)
+            for i = 1, #kids - MAX_LINES do kids[i]:Destroy() end
         end
     end
 end
 
--- ── action row ───────────────────────────────────────────────────────────────
-local ActRow = Instance.new("Frame")
-ActRow.BackgroundTransparency = 1
-ActRow.ZIndex = 6
-ActRow.Parent = Panel
+--────────────────────────────────────────────── action row
+local ActionRow = Instance.new("Frame")
+ActionRow.BackgroundTransparency = 1
+ActionRow.ZIndex = 6
+ActionRow.Parent = Panel
 
-local AL = Instance.new("UIListLayout")
-AL.FillDirection = Enum.FillDirection.Horizontal
-AL.SortOrder = Enum.SortOrder.LayoutOrder
-AL.Padding = UDim.new(0, 4)
-AL.Parent = ActRow
+local ActionLayout = Instance.new("UIListLayout")
+ActionLayout.FillDirection = Enum.FillDirection.Horizontal
+ActionLayout.SortOrder = Enum.SortOrder.LayoutOrder
+ActionLayout.Padding = UDim.new(0, 6)
+ActionLayout.Parent = ActionRow
 
-local function ActBtn(txt, bg, order, vis)
+local function actionButton(text, tint, order)
     local b = Instance.new("TextButton")
-    b.Size = UDim2.new(0, 80, 1, 0)
-    b.BackgroundColor3 = bg
-    b.Text = txt
-    b.Font = Enum.Font.GothamBold
-    b.TextColor3 = Color3.fromRGB(255, 255, 255)
-    b.TextSize = 9
-    b.Visible = (vis ~= false)
+    b.BackgroundColor3 = THEME.card
+    b.Text = text
+    b.Font = FONT_MED
+    b.TextColor3 = tint or THEME.text
+    b.TextSize = 10
     b.LayoutOrder = order
     b.ZIndex = 6
-    b.Parent = ActRow
-    corner(b, 5)
+    b.Parent = ActionRow
+    corner(b, 8)
+    stroke(b, 1, THEME.strokeSoft, 0.35)
+    addButtonFeel(b, THEME.card, THEME.cardAlt, THEME.strokeSoft)
     return b
 end
 
-local ExecBtn  = ActBtn("▶ Run",   Color3.fromRGB(40, 140, 200), 1, false)
-local ScanBtn  = ActBtn("🔍 Scan", Color3.fromRGB(110, 45, 155), 2, true)
-local ClearBtn = ActBtn("🗑 Clear", Color3.fromRGB(45, 45, 60),   3, true)
+local RunBtn   = actionButton("▶  Run", THEME.mint, 1)
+local ScanBtn  = actionButton("◎  Scan", THEME.violet, 2)
+local ClearBtn = actionButton("✕  Clear", THEME.textDim, 3)
+RunBtn.Visible = false
 
--- ── input ────────────────────────────────────────────────────────────────────
-local InputWrap = Instance.new("ScrollingFrame")
-InputWrap.BackgroundColor3 = Color3.fromRGB(12, 12, 24)
-InputWrap.BorderSizePixel = 0
-InputWrap.ScrollBarThickness = 2
-InputWrap.ScrollBarImageColor3 = Color3.fromRGB(60, 60, 110)
-InputWrap.AutomaticCanvasSize = Enum.AutomaticSize.Y
-InputWrap.CanvasSize = UDim2.new(0, 0, 0, 0)
-InputWrap.ZIndex = 6
-InputWrap.Parent = Panel
-corner(InputWrap, 6)
-stroke(InputWrap, 1, Color3.fromRGB(45, 45, 78))
+--────────────────────────────────────────────── input
+local InputWell = Instance.new("ScrollingFrame")
+InputWell.BackgroundColor3 = THEME.well
+InputWell.BorderSizePixel = 0
+InputWell.ScrollBarThickness = 2
+InputWell.ScrollBarImageColor3 = THEME.stroke
+InputWell.AutomaticCanvasSize = Enum.AutomaticSize.Y
+InputWell.CanvasSize = UDim2.new(0, 0, 0, 0)
+InputWell.ZIndex = 6
+InputWell.Parent = Panel
+corner(InputWell, 10)
+stroke(InputWell, 1, THEME.strokeSoft, 0.35)
 
 local InputBox = Instance.new("TextBox")
 InputBox.Size = UDim2.new(1, 0, 0, 0)
 InputBox.AutomaticSize = Enum.AutomaticSize.Y
 InputBox.BackgroundTransparency = 1
-InputBox.PlaceholderText = "ask anything…"
-InputBox.PlaceholderColor3 = Color3.fromRGB(55, 55, 85)
+InputBox.PlaceholderText = "what do you want to build?"
+InputBox.PlaceholderColor3 = THEME.textFaint
 InputBox.Text = ""
-InputBox.TextColor3 = Color3.fromRGB(225, 225, 255)
-InputBox.Font = Enum.Font.Code
-InputBox.TextSize = 9
+InputBox.TextColor3 = THEME.text
+InputBox.Font = FONT
+InputBox.TextSize = 12
 InputBox.MultiLine = true
 InputBox.TextWrapped = true
 InputBox.ClearTextOnFocus = false
 InputBox.TextXAlignment = Enum.TextXAlignment.Left
 InputBox.TextYAlignment = Enum.TextYAlignment.Top
 InputBox.ZIndex = 7
-InputBox.Parent = InputWrap
+InputBox.Parent = InputWell
+pad(InputBox, 9, 9, 8, 8)
 
-local IP = Instance.new("UIPadding")
-IP.PaddingLeft = UDim.new(0, 4)
-IP.PaddingRight = UDim.new(0, 4)
-IP.PaddingTop = UDim.new(0, 4)
-IP.PaddingBottom = UDim.new(0, 4)
-IP.Parent = InputBox
-
--- ── ASK ──────────────────────────────────────────────────────────────────────
+--────────────────────────────────────────────── ask
 local AskBtn = Instance.new("TextButton")
-AskBtn.BackgroundColor3 = Color3.fromRGB(195, 45, 45)
-AskBtn.Text = "⚡  ASK"
-AskBtn.Font = Enum.Font.GothamBold
+AskBtn.BackgroundColor3 = THEME.violetDeep
+AskBtn.Text = "Ask  ✦"
+AskBtn.Font = FONT_BOLD
 AskBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-AskBtn.TextSize = 12
+AskBtn.TextSize = 14
+AskBtn.AutoButtonColor = false
 AskBtn.ZIndex = 6
 AskBtn.Parent = Panel
-corner(AskBtn, 6)
-stroke(AskBtn, 1, Color3.fromRGB(255, 70, 70))
+corner(AskBtn, 10)
+stroke(AskBtn, 1, THEME.violet, 0.25)
+local AskGradient = gradient(AskBtn, THEME.violet, THEME.pink, 15)
+TweenService:Create(AskBtn, TweenInfo.new(0.15), {}):Play()
 
--- ── layout maths: everything below is positioned from the panel size, so the
---    window can be any size and nothing ever overlaps (v2 used fixed offsets
---    and drew the ASK button on top of the input box on phones) ─────────────
-local LAYOUT = {
-    pad = 6, gap = 3,
-    tbar = 30, prov = 14, picker = 17, status = 14,
-    actions = 22, input = 52, ask = 28, bottom = 6,
+--────────────────────────────────────────────── layout
+local METRICS = {
+    padX = 12,
+    header = 46,
+    status = 24,
+    chips = 36,
+    actions = 30,
+    input = 62,
+    ask = 38,
+    gap = 6,
+    bottom = 12,
 }
 
 local function ApplyLayout()
-    local pad, gap = LAYOUT.pad, LAYOUT.gap
-    local inner = panelW - pad * 2
-    local y = LAYOUT.tbar + gap
+    local p, inner = METRICS.padX, nil
+    local vp = screenSize()
 
-    local function place(obj, h)
-        obj.Position = UDim2.new(0, pad, 0, y)
-        obj.Size = UDim2.new(0, inner, 0, h)
-        y = y + h + gap
-    end
+    -- keep a 8px margin so the panel can always be dragged and never clips
+    local maxW = math.max(240, vp.X - 16)
+    local maxH = math.max(280, vp.Y - 16)
+    panelW = math.min(math.clamp(math.floor(vp.X * 0.90), 296, 356), maxW)
+    panelH = math.min(math.clamp(math.floor(vp.Y * 0.74), 372, 520), maxH)
+    Panel.Size = UDim2.new(0, panelW, 0, panelH)
+    inner = panelW - p * 2
 
-    TBar.Size = UDim2.new(1, 0, 0, LAYOUT.tbar)
-    place(ProvBadge,   LAYOUT.prov)
-    place(PickerFrame, LAYOUT.picker)
-    place(StatusBar,   LAYOUT.status)
+    Header.Size = UDim2.new(1, 0, 0, METRICS.header)
+    StatusRow.Position = UDim2.new(0, p, 0, METRICS.header)
+    StatusRow.Size = UDim2.new(0, inner, 0, METRICS.status)
 
-    local bottomH = LAYOUT.actions + gap + LAYOUT.input + gap + LAYOUT.ask + LAYOUT.bottom
-    local logH = math.max(50, panelH - y - bottomH)
+    ChipsRow.Position = UDim2.new(0, p, 0, METRICS.header + METRICS.status + METRICS.gap)
+    ChipsRow.Size = UDim2.new(0, inner, 0, METRICS.chips)
+    local chipW = math.floor((inner - 6) / 2)
+    GemChip.Size = UDim2.new(0, chipW, 1, 0)
+    OrChip.Size  = UDim2.new(0, chipW, 1, 0)
 
-    OutScroll.Position = UDim2.new(0, pad, 0, y)
-    OutScroll.Size = UDim2.new(0, inner, 0, logH)
-    y = y + logH + gap
+    local below = METRICS.header + METRICS.status + METRICS.gap * 2 + METRICS.chips
+    -- shrink the input/ask blocks a little on short screens
+    local short = panelH < 400
+    local actionsH = short and 26 or METRICS.actions
+    local inputH   = short and 46 or METRICS.input
+    local askH     = short and 32 or METRICS.ask
 
-    place(ActRow, LAYOUT.actions)
-    place(InputWrap, LAYOUT.input)
-    place(AskBtn, LAYOUT.ask)
+    local bottomBlock = actionsH + METRICS.gap + inputH + METRICS.gap
+        + askH + METRICS.bottom
+    local logH = math.max(56, panelH - below - bottomBlock)
 
-    -- 3 action buttons share the row width
-    local bw = math.floor((inner - gap * 2) / 3)
-    ExecBtn.Size  = UDim2.new(0, bw, 1, 0)
-    ScanBtn.Size  = UDim2.new(0, bw, 1, 0)
-    ClearBtn.Size = UDim2.new(0, bw, 1, 0)
+    LogScroll.Position = UDim2.new(0, p, 0, below)
+    LogScroll.Size = UDim2.new(0, inner, 0, logH)
 
-    -- dropdown hangs under the picker row, kept inside the panel
-    Dropdown.Position = UDim2.new(0, pad + 44, 0, LAYOUT.tbar + gap * 3 + LAYOUT.prov + LAYOUT.picker - 2)
-    Dropdown.Size = UDim2.new(0, math.min(170, inner - 44), 0, #CONFIG.gemini.models * 20 + 6)
+    local y = below + logH + METRICS.gap
+    ActionRow.Position = UDim2.new(0, p, 0, y)
+    ActionRow.Size = UDim2.new(0, inner, 0, actionsH)
+    local btnW = math.floor((inner - 12) / 3)
+    RunBtn.Size   = UDim2.new(0, btnW, 1, 0)
+    ScanBtn.Size  = UDim2.new(0, btnW, 1, 0)
+    ClearBtn.Size = UDim2.new(0, btnW, 1, 0)
+
+    y = y + actionsH + METRICS.gap
+    InputWell.Position = UDim2.new(0, p, 0, y)
+    InputWell.Size = UDim2.new(0, inner, 0, inputH)
+
+    y = y + inputH + METRICS.gap
+    AskBtn.Position = UDim2.new(0, p, 0, y)
+    AskBtn.Size = UDim2.new(0, inner, 0, askH)
 end
 
 local function layoutPanel(recenter)
     local vp = screenSize()
-    panelW = math.clamp(math.floor(vp.X * 0.86), 258, 330)
-    panelH = math.clamp(math.floor(vp.Y * 0.68), 320, 460)
-    Panel.Size = UDim2.new(0, panelW, 0, panelH)
-
+    ApplyLayout()
     local w, h = sizePx(Panel)
     if w <= 0 then w, h = panelW, panelH end
     local x, y
@@ -1169,198 +1456,313 @@ local function layoutPanel(recenter)
     end
     x, y = clampTo(x, y, w, h)
     Panel.Position = UDim2.new(0, x, 0, y)
-
-    ApplyLayout()
 end
 
 layoutPanel(true)
 
--- react to rotation / window resizes
 pcall(function()
-    local cam = workspace.CurrentCamera
-    cam:GetPropertyChangedSignal("ViewportSize"):Connect(function()
+    workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
         layoutPanel(false)
     end)
 end)
 
--- ══════════════════════════════════════════════════════════════════════════════
--- 8.  SETTINGS OVERLAY (API keys)
--- ══════════════════════════════════════════════════════════════════════════════
-local Settings = Instance.new("Frame")
-Settings.Size = UDim2.new(1, 0, 1, 0)
-Settings.BackgroundColor3 = Color3.fromRGB(12, 12, 22)
-Settings.BorderSizePixel = 0
-Settings.Visible = false
-Settings.ZIndex = 40
-Settings.Parent = Panel
-corner(Settings, 10)
+--══════════════════════════════════════════════════════════════════════════════
+-- 13.  SHEETS (settings + model picker share this)
+--══════════════════════════════════════════════════════════════════════════════
+local function makeSheet()
+    local sheet = Instance.new("Frame")
+    sheet.Size = UDim2.new(1, 0, 1, 0)
+    sheet.BackgroundColor3 = THEME.bgTop
+    sheet.BorderSizePixel = 0
+    sheet.Visible = false
+    sheet.ZIndex = 40
+    sheet.Parent = Panel
+    corner(sheet, 14)
+    gradient(sheet, THEME.bgTop, THEME.bgBottom, 90)
 
-local SScroll = Instance.new("ScrollingFrame")
-SScroll.Size = UDim2.new(1, -12, 1, -12)
-SScroll.Position = UDim2.new(0, 6, 0, 6)
-SScroll.BackgroundTransparency = 1
-SScroll.BorderSizePixel = 0
-SScroll.ScrollBarThickness = 3
-SScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
-SScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
-SScroll.ZIndex = 41
-SScroll.Parent = Settings
+    local head = Instance.new("Frame")
+    head.Size = UDim2.new(1, -24, 0, 26)
+    head.Position = UDim2.new(0, 12, 0, 10)
+    head.BackgroundTransparency = 1
+    head.ZIndex = 41
+    head.Parent = sheet
 
-local SL = Instance.new("UIListLayout")
-SL.SortOrder = Enum.SortOrder.LayoutOrder
-SL.Padding = UDim.new(0, 4)
-SL.Parent = SScroll
+    local title = label(head, "", UDim2.new(1, -40, 1, 0), THEME.text, FONT_BOLD, 12)
+    title.ZIndex = 42
 
-local SPad = Instance.new("UIPadding")
-SPad.PaddingLeft = UDim.new(0, 4)
-SPad.PaddingRight = UDim.new(0, 4)
-SPad.PaddingTop = UDim.new(0, 2)
-SPad.PaddingBottom = UDim.new(0, 4)
-SPad.Parent = SScroll
+    local close = Instance.new("TextButton")
+    close.Size = UDim2.new(0, 26, 0, 26)
+    close.Position = UDim2.new(1, -26, 0, 0)
+    close.BackgroundColor3 = THEME.card
+    close.Text = "✕"
+    close.Font = FONT_BOLD
+    close.TextColor3 = THEME.coral
+    close.TextSize = 11
+    close.ZIndex = 42
+    close.Parent = head
+    corner(close, 8)
+    stroke(close, 1, THEME.strokeSoft, 0.3)
+    addButtonFeel(close, THEME.card, THEME.cardAlt, THEME.strokeSoft)
+    close.MouseButton1Click:Connect(function() sheet.Visible = false end)
 
-local order = 0
-local function sNext() order = order + 1 return order end
+    local scroll = Instance.new("ScrollingFrame")
+    scroll.Size = UDim2.new(1, -20, 1, -52)
+    scroll.Position = UDim2.new(0, 10, 0, 44)
+    scroll.BackgroundTransparency = 1
+    scroll.BorderSizePixel = 0
+    scroll.ScrollBarThickness = 3
+    scroll.ScrollBarImageColor3 = THEME.stroke
+    scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+    scroll.ZIndex = 41
+    scroll.Parent = sheet
+    pad(scroll, 2, 2, 0, 8)
 
-local SHeaderRow = Instance.new("Frame")
-SHeaderRow.Size = UDim2.new(1, 0, 0, 22)
-SHeaderRow.BackgroundTransparency = 1
-SHeaderRow.LayoutOrder = sNext()
-SHeaderRow.ZIndex = 41
-SHeaderRow.Parent = SScroll
+    local list = Instance.new("UIListLayout")
+    list.SortOrder = Enum.SortOrder.LayoutOrder
+    list.Padding = UDim.new(0, 6)
+    list.Parent = scroll
 
-local SHeader = Instance.new("TextLabel")
-SHeader.Text = "⚙  API KEYS"
-SHeader.Size = UDim2.new(1, -26, 1, 0)
-SHeader.BackgroundTransparency = 1
-SHeader.TextColor3 = Color3.fromRGB(120, 170, 255)
-SHeader.Font = Enum.Font.GothamBold
-SHeader.TextSize = 11
-SHeader.TextXAlignment = Enum.TextXAlignment.Left
-SHeader.ZIndex = 42
-SHeader.Parent = SHeaderRow
+    return sheet, scroll, title
+end
 
-local SClose = Instance.new("TextButton")
-SClose.Size = UDim2.new(0, 22, 0, 22)
-SClose.Position = UDim2.new(1, -22, 0, 0)
-SClose.BackgroundColor3 = Color3.fromRGB(180, 40, 40)
-SClose.Text = "✕"
-SClose.Font = Enum.Font.GothamBold
-SClose.TextColor3 = Color3.fromRGB(255, 255, 255)
-SClose.TextSize = 10
-SClose.ZIndex = 42
-SClose.Parent = SHeaderRow
-corner(SClose, 4)
-SClose.MouseButton1Click:Connect(function() Settings.Visible = false end)
+--────────────────────────────────────────────── settings sheet
+local SettingsSheet, SettingsScroll, SettingsTitle = makeSheet()
+SettingsTitle.Text = "Settings"
+SettingsBtn.MouseButton1Click:Connect(function()
+    SettingsSheet.Visible = not SettingsSheet.Visible
+end)
 
+local settingsOrder = 0
+local function sOrder() settingsOrder = settingsOrder + 1 return settingsOrder end
 local settingsBoxes = {}
 
-local function keyRow(labelText, keyName, placeholder)
+local function settingsKeyRow(keyName, titleText, placeholder)
     local row = Instance.new("Frame")
-    row.Size = UDim2.new(1, 0, 0, 36)
-    row.BackgroundTransparency = 1
-    row.LayoutOrder = sNext()
+    row.Size = UDim2.new(1, 0, 0, 44)
+    row.BackgroundColor3 = THEME.card
+    row.LayoutOrder = sOrder()
     row.ZIndex = 41
-    row.Parent = SScroll
+    row.Parent = SettingsScroll
+    corner(row, 10)
+    stroke(row, 1, THEME.strokeSoft, 0.5)
+    pad(row, 10, 10, 7, 8)
 
-    local l = Instance.new("TextLabel")
-    l.Text = labelText
-    l.Size = UDim2.new(1, 0, 0, 11)
-    l.BackgroundTransparency = 1
-    l.TextColor3 = Color3.fromRGB(90, 110, 160)
-    l.Font = Enum.Font.Code
-    l.TextSize = 8
-    l.TextXAlignment = Enum.TextXAlignment.Left
+    local l = label(row, titleText, UDim2.new(1, 0, 0, 12), THEME.textDim, FONT_MED, 9)
     l.ZIndex = 42
-    l.Parent = row
 
     local box = Instance.new("TextBox")
-    box.Size = UDim2.new(1, 0, 0, 22)
-    box.Position = UDim2.new(0, 0, 0, 13)
-    box.BackgroundColor3 = Color3.fromRGB(20, 20, 36)
+    box.Size = UDim2.new(1, 0, 0, 20)
+    box.Position = UDim2.new(0, 0, 0, 15)
+    box.BackgroundColor3 = THEME.well
     box.Text = KEYS[keyName] or ""
     box.PlaceholderText = placeholder or ""
-    box.PlaceholderColor3 = Color3.fromRGB(60, 60, 90)
-    box.TextColor3 = Color3.fromRGB(215, 225, 255)
-    box.Font = Enum.Font.Code
-    box.TextSize = 8
+    box.PlaceholderColor3 = THEME.textFaint
+    box.TextColor3 = THEME.text
+    box.Font = FONT_MONO
+    box.TextSize = 9
     box.TextXAlignment = Enum.TextXAlignment.Left
     box.ClearTextOnFocus = false
     box.ZIndex = 42
     box.Parent = row
-    corner(box, 4)
-    stroke(box, 1, Color3.fromRGB(40, 45, 80))
-
-    local bp = Instance.new("UIPadding")
-    bp.PaddingLeft = UDim.new(0, 4)
-    bp.PaddingRight = UDim.new(0, 4)
-    bp.Parent = box
+    corner(box, 6)
+    stroke(box, 1, THEME.strokeSoft, 0.4)
+    pad(box, 6, 6, 0, 0)
 
     settingsBoxes[#settingsBoxes + 1] = { box = box, key = keyName }
-    return box
 end
 
-keyRow("GEMINI KEY (AQ.… or AIza…)", "gemini", "AQ.…")
-keyRow("OPENROUTER KEY",             "openrouter", "sk-or-v1-…")
-keyRow("TOKENHARBOR KEY",            "tokenharbor", "thk_live_…")
+settingsKeyRow("gemini", "Gemini key · aistudio.google.com/apikey", "AQ.… or AIza…")
+settingsKeyRow("openrouter", "OpenRouter key · openrouter.ai/keys", "sk-or-v1-…")
+settingsKeyRow("tokenharbor", "TokenHarbor key (optional)", "thk_live_…")
 
-local SHint = Instance.new("TextLabel")
-SHint.Text = "Free Gemini key → aistudio.google.com/apikey\n" ..
-             "Free OpenRouter key → openrouter.ai/keys\n" ..
-             "Leave blank to skip a provider."
-SHint.Size = UDim2.new(1, 0, 0, 44)
-SHint.BackgroundTransparency = 1
-SHint.TextColor3 = Color3.fromRGB(80, 90, 130)
-SHint.Font = Enum.Font.Code
-SHint.TextSize = 8
-SHint.TextWrapped = true
-SHint.TextXAlignment = Enum.TextXAlignment.Left
-SHint.TextYAlignment = Enum.TextYAlignment.Top
-SHint.LayoutOrder = sNext()
-SHint.ZIndex = 41
-SHint.Parent = SScroll
+local hint = label(SettingsScroll,
+    "Free tiers: Gemini free key, OpenRouter free models.\nKeys stay on this device.",
+    UDim2.new(1, 0, 0, 30), THEME.textFaint, FONT, 8)
+hint.TextWrapped = true
+hint.TextYAlignment = Enum.TextYAlignment.Top
+hint.LayoutOrder = sOrder()
+hint.ZIndex = 41
 
-local SaveKeysBtn = Instance.new("TextButton")
-SaveKeysBtn.Size = UDim2.new(1, 0, 0, 28)
-SaveKeysBtn.BackgroundColor3 = Color3.fromRGB(40, 130, 90)
-SaveKeysBtn.Text = "💾  Save & reconnect"
-SaveKeysBtn.Font = Enum.Font.GothamBold
-SaveKeysBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-SaveKeysBtn.TextSize = 10
-SaveKeysBtn.LayoutOrder = sNext()
-SaveKeysBtn.ZIndex = 41
-SaveKeysBtn.Parent = SScroll
-corner(SaveKeysBtn, 5)
+local SaveBtn = Instance.new("TextButton")
+SaveBtn.Size = UDim2.new(1, 0, 0, 32)
+SaveBtn.BackgroundColor3 = THEME.violetDeep
+SaveBtn.Text = "Save & connect"
+SaveBtn.Font = FONT_BOLD
+SaveBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+SaveBtn.TextSize = 11
+SaveBtn.AutoButtonColor = false
+SaveBtn.LayoutOrder = sOrder()
+SaveBtn.ZIndex = 41
+SaveBtn.Parent = SettingsScroll
+corner(SaveBtn, 10)
+gradient(SaveBtn, THEME.violetDeep, THEME.violet, 15)
 
-local ReconnectBtn = Instance.new("TextButton")
-ReconnectBtn.Size = UDim2.new(1, 0, 0, 26)
-ReconnectBtn.BackgroundColor3 = Color3.fromRGB(45, 45, 70)
-ReconnectBtn.Text = "🔄  Retry all providers"
-ReconnectBtn.Font = Enum.Font.GothamBold
-ReconnectBtn.TextColor3 = Color3.fromRGB(220, 220, 240)
-ReconnectBtn.TextSize = 10
-ReconnectBtn.LayoutOrder = sNext()
-ReconnectBtn.ZIndex = 41
-ReconnectBtn.Parent = SScroll
-corner(ReconnectBtn, 5)
+local RefreshBtn = Instance.new("TextButton")
+RefreshBtn.Size = UDim2.new(1, 0, 0, 28)
+RefreshBtn.BackgroundColor3 = THEME.card
+RefreshBtn.Text = "Refresh model lists"
+RefreshBtn.Font = FONT_MED
+RefreshBtn.TextColor3 = THEME.textDim
+RefreshBtn.TextSize = 10
+RefreshBtn.LayoutOrder = sOrder()
+RefreshBtn.ZIndex = 41
+RefreshBtn.Parent = SettingsScroll
+corner(RefreshBtn, 10)
+stroke(RefreshBtn, 1, THEME.strokeSoft, 0.4)
+addButtonFeel(RefreshBtn, THEME.card, THEME.cardAlt, THEME.strokeSoft)
 
-local SHttpsrc = Instance.new("TextLabel")
-SHttpsrc.Text = "http: " .. tostring(HTTP_SOURCE or "not found")
-SHttpsrc.Size = UDim2.new(1, 0, 0, 12)
-SHttpsrc.BackgroundTransparency = 1
-SHttpsrc.TextColor3 = HTTP_SOURCE and Color3.fromRGB(70, 160, 110) or Color3.fromRGB(200, 80, 80)
-SHttpsrc.Font = Enum.Font.Code
-SHttpsrc.TextSize = 8
-SHttpsrc.LayoutOrder = sNext()
-SHttpsrc.ZIndex = 41
-SHttpsrc.Parent = SScroll
+--────────────────────────────────────────────── model picker sheet
+local PickerSheet, PickerScroll, PickerTitle = makeSheet()
+local pickerProvider = "openrouter"
 
-SettingsBtn.MouseButton1Click:Connect(function()
-    Settings.Visible = not Settings.Visible
-end)
+local function pickerRows()
+    for _, c in ipairs(PickerScroll:GetChildren()) do
+        if c:IsA("TextButton") or c:IsA("Frame") or c:IsA("TextLabel") then c:Destroy() end
+    end
 
--- ══════════════════════════════════════════════════════════════════════════════
--- 9.  STATE + ACTIONS
--- ══════════════════════════════════════════════════════════════════════════════
+    local cat = Catalog[pickerProvider]
+    local accent = (pickerProvider == "gemini") and THEME.cyan or THEME.amber
+
+    local statusRow = label(PickerScroll, "", UDim2.new(1, 0, 0, 16), THEME.textFaint, FONT_MONO, 8)
+    statusRow.LayoutOrder = 1
+    statusRow.ZIndex = 42
+
+    if cat.state == "loading" then
+        statusRow.Text = "fetching the live model list…"
+        statusRow.TextColor3 = THEME.amber
+    elseif cat.state == "error" then
+        statusRow.Text = "couldn't load: " .. tostring(cat.error)
+        statusRow.TextColor3 = THEME.coral
+    elseif #cat.list == 0 then
+        statusRow.Text = "no models — add a key or refresh"
+        statusRow.TextColor3 = THEME.textFaint
+    else
+        statusRow.Text = string.format("%d models available · tap to pick", #cat.list)
+        statusRow.TextColor3 = THEME.mint
+    end
+
+    if cat.state == "error" then
+        local retry = Instance.new("TextButton")
+        retry.Size = UDim2.new(1, 0, 0, 30)
+        retry.BackgroundColor3 = THEME.card
+        retry.Text = "↻  Try fetching again"
+        retry.Font = FONT_MED
+        retry.TextColor3 = THEME.amber
+        retry.TextSize = 10
+        retry.LayoutOrder = 2
+        retry.ZIndex = 41
+        retry.Parent = PickerScroll
+        corner(retry, 9)
+        stroke(retry, 1, THEME.amber, 0.6)
+        addButtonFeel(retry, THEME.card, THEME.cardAlt, THEME.strokeSoft)
+        retry.MouseButton1Click:Connect(function()
+            if pickerProvider == "gemini" then
+                task.spawn(function() pcall(FetchGeminiModels, true) end)
+            else
+                task.spawn(function() pcall(FetchOpenRouterModels, true) end)
+            end
+            task.defer(pickerRows)
+        end)
+    end
+
+    for i, m in ipairs(cat.list) do
+        local selected = (cat.selected == m.id)
+        local row = Instance.new("TextButton")
+        row.Size = UDim2.new(1, 0, 0, 38)
+        row.BackgroundColor3 = selected and THEME.cardAlt or THEME.card
+        row.Text = ""
+        row.LayoutOrder = i + 1
+        row.ZIndex = 41
+        row.Parent = PickerScroll
+        corner(row, 10)
+        stroke(row, 1, selected and accent or THEME.strokeSoft, selected and 0.2 or 0.6)
+
+        local name = label(row, m.label or m.id, UDim2.new(1, -18, 0, 14), THEME.text, FONT_MED, 10)
+        name.Position = UDim2.new(0, 10, 0, 5)
+        name.TextTruncate = Enum.TextTruncate.AtEnd
+        name.ZIndex = 42
+
+        local sub = label(row, m.id, UDim2.new(1, -18, 0, 12), THEME.textFaint, FONT_MONO, 8)
+        sub.Position = UDim2.new(0, 10, 0, 20)
+        sub.TextTruncate = Enum.TextTruncate.AtEnd
+        sub.ZIndex = 42
+
+        local tick = label(row, selected and "✓" or "", UDim2.new(0, 14, 1, 0), accent, FONT_BOLD, 12,
+            Enum.TextXAlignment.Right)
+        tick.Position = UDim2.new(1, -22, 0, 0)
+        tick.ZIndex = 42
+
+        addButtonFeel(row, row.BackgroundColor3, THEME.cardAlt, THEME.strokeSoft)
+
+        row.MouseButton1Click:Connect(function()
+            Catalog[pickerProvider].selected = m.id
+            Prefs.models[pickerProvider] = m.id
+            savePrefs()
+            if pickerProvider == "gemini" then
+                GemValue.Text = m.id
+                GemValue.TextColor3 = THEME.text
+            else
+                OrValue.Text = m.id
+                OrValue.TextColor3 = THEME.text
+            end
+            PickerSheet.Visible = false
+            Log("model set · " .. pickerProvider .. " → " .. m.id, THEME.textDim)
+        end)
+    end
+end
+
+local function openPicker(provider)
+    pickerProvider = provider
+    PickerTitle.Text = (provider == "gemini") and "Gemini models" or "OpenRouter free models"
+    pickerRows()
+    PickerSheet.Visible = true
+    if Catalog[provider].state == "idle" or Catalog[provider].state == "error" then
+        task.spawn(function()
+            if provider == "gemini" then
+                pcall(FetchGeminiModels, true)
+            else
+                pcall(FetchOpenRouterModels, true)
+            end
+        end)
+    end
+end
+
+GemChip.MouseButton1Click:Connect(function() openPicker("gemini") end)
+OrChip.MouseButton1Click:Connect(function() openPicker("openrouter") end)
+
+-- keep the chips in sync with whatever the catalog does
+OnCatalogChanged = function(provider)
+    local cat = Catalog[provider]
+    local valueLbl = (provider == "gemini") and GemValue or OrValue
+    local scope = tostring(provider)
+
+    if cat.state == "loading" then
+        valueLbl.Text = "loading…"
+        valueLbl.TextColor3 = THEME.amber
+    elseif cat.state == "error" then
+        valueLbl.Text = cat.selected or "tap to pick"
+        valueLbl.TextColor3 = cat.selected and THEME.text or THEME.coral
+    elseif cat.state == "ready" then
+        local shown = cat.selected
+        if not shown then
+            shown = (cat.list[1] and cat.list[1].id) or "tap to pick"
+        end
+        valueLbl.Text = shown
+        valueLbl.TextColor3 = THEME.text
+    end
+    local _ = scope
+
+    if PickerSheet.Visible then
+        task.defer(function()
+            if PickerSheet.Visible and pickerProvider == provider then pickerRows() end
+        end)
+    end
+end
+
+--══════════════════════════════════════════════════════════════════════════════
+-- 14.  STATE + ACTIONS
+--══════════════════════════════════════════════════════════════════════════════
 local Connected   = false
 local Busy        = false
 local LastCode    = nil
@@ -1369,11 +1771,13 @@ local LastGameCtx = nil
 local function setBusy(on)
     Busy = on
     if on then
-        AskBtn.BackgroundColor3 = Color3.fromRGB(55, 55, 55)
-        AskBtn.Text = "…"
+        AskBtn.Text = "thinking…"
+        AskGradient.Color = ColorSequence.new(THEME.stroke, THEME.card)
+        AskBtn.TextColor3 = THEME.textDim
     else
-        AskBtn.BackgroundColor3 = Color3.fromRGB(195, 45, 45)
-        AskBtn.Text = "⚡  ASK"
+        AskBtn.Text = "Ask  ✦"
+        AskGradient.Color = ColorSequence.new(THEME.violet, THEME.pink)
+        AskBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
     end
 end
 
@@ -1381,9 +1785,9 @@ local function DoScan()
     local ok, res = pcall(ScanGame)
     if ok then
         LastGameCtx = res
-        Log("🔍 scanned — PlaceID " .. tostring(game.PlaceId), Color3.fromRGB(150, 80, 200))
+        Log("game scanned · PlaceID " .. tostring(game.PlaceId), THEME.violet)
     else
-        Log("❌ scan: " .. tostring(res):sub(1, 90), Color3.fromRGB(215, 55, 55))
+        Log("scan failed: " .. tostring(res):sub(1, 80), THEME.coral)
     end
 end
 
@@ -1393,95 +1797,98 @@ end)
 
 ClearBtn.MouseButton1Click:Connect(function()
     ChatHistory = {}
-    for _, c in ipairs(OutScroll:GetChildren()) do
+    for _, c in ipairs(LogScroll:GetChildren()) do
         if c:IsA("TextLabel") then c:Destroy() end
     end
-    lineCount = 0
+    logLines = 0
     LastCode = nil
-    ExecBtn.Visible = false
-    Log("🗑 cleared.", Color3.fromRGB(70, 70, 100))
+    RunBtn.Visible = false
+    Log("cleared.", THEME.textFaint)
 end)
 
 local function RunLastCode()
     if not LastCode then
-        Log("⚠ nothing to run yet.", Color3.fromRGB(255, 180, 40))
+        Log("nothing to run yet.", THEME.amber)
         return
     end
-    Log("▶ executing…", Color3.fromRGB(52, 150, 215))
+    Log("running the generated script…", THEME.cyan)
     local ok, err = ExecScript(LastCode, function(runtimeErr)
-        Log("❌ runtime: " .. tostring(runtimeErr):sub(1, 240), Color3.fromRGB(215, 55, 55))
-        StatusLbl.Text = "❌ runtime error"
-        StatusLbl.TextColor3 = Color3.fromRGB(215, 55, 55)
+        Log("runtime error: " .. tostring(runtimeErr):sub(1, 200), THEME.coral)
+        setStatus("runtime error", THEME.coral, THEME.coral)
     end)
     if ok then
-        Log("✅ script launched.", Color3.fromRGB(46, 200, 110))
-        StatusLbl.Text = "✅ executed"
-        StatusLbl.TextColor3 = Color3.fromRGB(46, 200, 110)
+        Log("done — script is running.", THEME.mint)
+        setStatus("executed", THEME.mint, THEME.mint)
     else
-        Log("❌ " .. tostring(err), Color3.fromRGB(215, 55, 55))
-        StatusLbl.Text = "❌ execution failed"
-        StatusLbl.TextColor3 = Color3.fromRGB(215, 55, 55)
+        Log(tostring(err), THEME.coral)
+        setStatus("couldn't run it", THEME.coral, THEME.coral)
     end
 end
 
-ExecBtn.MouseButton1Click:Connect(RunLastCode)
+RunBtn.MouseButton1Click:Connect(RunLastCode)
+
+local function summarizeFailures(failures)
+    local parts = {}
+    for _, f in ipairs(failures or {}) do
+        local msg = tostring(f.err or "failed"):gsub("%s+", " ")
+        if #msg > 70 then msg = msg:sub(1, 70) .. "…" end
+        parts[#parts + 1] = f.name .. ": " .. msg
+    end
+    return table.concat(parts, "  |  ")
+end
 
 local Submit
-
 Submit = function()
     if Busy then return end
     local msg = (InputBox.Text or ""):match("^%s*(.-)%s*$")
     if msg == "" then return end
-    if not Connected then
-        Log("⚠ not connected — open ⚙ and check your keys.", Color3.fromRGB(255, 180, 40))
-        Settings.Visible = true
+    if not RawRequest then
+        Log("this executor has no http function — re-inject Delta.", THEME.coral)
+        setStatus("no http function", THEME.coral, THEME.coral)
         return
     end
 
     setBusy(true)
     InputBox.Text = ""
-    StatusLbl.Text = "⏳ thinking…"
-    StatusLbl.TextColor3 = Color3.fromRGB(255, 200, 80)
-    Log("──────────", Color3.fromRGB(25, 25, 45))
-    Log("you: " .. msg:sub(1, 260) .. (#msg > 260 and "…" or ""), Color3.fromRGB(120, 165, 255))
+    setStatus("thinking…", THEME.amber, THEME.amber)
+    Log("you · " .. msg:sub(1, 220) .. (#msg > 220 and "…" or ""), THEME.cyan)
 
     task.spawn(function()
-        local ok, reply, prov, err = pcall(AskAI, msg, LastGameCtx, Log)
+        local ok, reply, prov, failures = pcall(AskAI, msg, LastGameCtx, Log)
         if not ok then
-            Log("❌ internal error: " .. tostring(reply), Color3.fromRGB(215, 55, 55))
-            StatusLbl.Text = "❌ internal error"
-            StatusLbl.TextColor3 = Color3.fromRGB(215, 55, 55)
+            Log("internal error: " .. tostring(reply):sub(1, 200), THEME.coral)
+            setStatus("internal error", THEME.coral, THEME.coral)
             setBusy(false)
             return
         end
 
         if not reply then
-            Log("❌ all providers failed.", Color3.fromRGB(215, 55, 55))
-            Log("   " .. tostring(err):sub(1, 220), Color3.fromRGB(180, 70, 70))
-            Log("   → tap ⚙ to check your API keys.", Color3.fromRGB(180, 140, 60))
-            StatusLbl.Text = "❌ all providers failed"
-            StatusLbl.TextColor3 = Color3.fromRGB(215, 55, 55)
-        else
-            SetProvBadge(prov)
-            for line in (reply .. "\n"):gmatch("(.-)\n") do Log(line) end
+            Log(summarizeFailures(failures), THEME.coral)
+            setStatus("no provider answered", THEME.coral, THEME.coral)
+            Log("tip · open ⚙ to fix keys, or tap a model row to pick another one.", THEME.textFaint)
+            setBusy(false)
+            return
+        end
 
-            local code = ExtractCode(reply)
-            if code then
-                LastCode = code
-                ExecBtn.Visible = true
-                StatusLbl.Text = "✅ script ready — tap Run"
-                StatusLbl.TextColor3 = Color3.fromRGB(46, 200, 110)
-                Log("▶ tap [Run] to execute.", Color3.fromRGB(46, 200, 110))
-                local lower = msg:lower()
-                if lower:find("run it", 1, true) or lower:find("auto run", 1, true)
-                    or lower:find("execute it", 1, true) or lower:find("run now", 1, true) then
-                    Log("⚡ auto-exec…", Color3.fromRGB(255, 180, 40))
-                    task.wait(0.3)
-                    RunLastCode()
-                end
-            else
-                StatusLbl.Text = "✅ reply received"
-                StatusLbl.TextColor3 = Color3.fromRGB(46, 200, 110)
+        Connected = true
+        local catName = prov == "gemini" and "gemini"
+            or (prov == "openrouter" and "openrouter" or tostring(prov))
+        setStatus("online · " .. catName, THEME.mint, THEME.mint)
+
+        for line in (reply .. "\n"):gmatch("(.-)\n") do
+            Log(line, THEME.text)
+        end
+
+        local code = ExtractCode(reply)
+        if code then
+            LastCode = code
+            RunBtn.Visible = true
+            Log("script ready · tap Run", THEME.mint)
+            local lower = msg:lower()
+            if lower:find("run it", 1, true) or lower:find("auto run", 1, true)
+                or lower:find("execute it", 1, true) or lower:find("run now", 1, true) then
+                task.wait(0.3)
+                RunLastCode()
             end
         end
         setBusy(false)
@@ -1490,88 +1897,89 @@ end
 
 AskBtn.MouseButton1Click:Connect(Submit)
 
--- ══════════════════════════════════════════════════════════════════════════════
--- 10. CONNECT / BOOT
--- ══════════════════════════════════════════════════════════════════════════════
+--══════════════════════════════════════════════════════════════════════════════
+-- 15.  CONNECT / BOOT
+--══════════════════════════════════════════════════════════════════════════════
+local function hasAnyKey()
+    return KEYS.gemini ~= "" or KEYS.openrouter ~= "" or KEYS.tokenharbor ~= ""
+end
+
 local function Connect(silent)
     if Busy then return end
+
     if not RawRequest then
-        StatusLbl.Text = "❌ no HTTP function"
-        StatusLbl.TextColor3 = Color3.fromRGB(215, 55, 55)
-        Log("❌ no HTTP function found.", Color3.fromRGB(215, 55, 55))
-        Log("   looked for: request, http_request, getgenv().request, syn.request, http.request", 
-            Color3.fromRGB(180, 140, 60))
-        Log("   → update/re-inject Delta, then run the script again.", Color3.fromRGB(180, 140, 60))
+        setStatus("no http function", THEME.coral, THEME.coral)
+        Log("no http function in this executor.", THEME.coral)
+        Log("looked for request, http_request, getgenv().request, syn.request.", THEME.textFaint)
         Notify("AI Helper", "No HTTP function — re-inject Delta.", 8)
         return
     end
 
-    if not (KEYS.gemini ~= "" or KEYS.openrouter ~= "" or KEYS.tokenharbor ~= "") then
-        StatusLbl.Text = "🔑 add an API key"
-        StatusLbl.TextColor3 = Color3.fromRGB(255, 190, 60)
-        Log("🔑 no API key yet.", Color3.fromRGB(255, 190, 60))
-        Log("   paste one in ⚙ → Save & reconnect.", Color3.fromRGB(180, 140, 60))
-        Log("   gemini: aistudio.google.com/apikey  (AQ.… or AIza…)", Color3.fromRGB(120, 160, 220))
-        Log("   openrouter: openrouter.ai/keys", Color3.fromRGB(120, 160, 220))
-        Settings.Visible = true
-        Notify("AI Helper", "Paste an API key in the ⚙ panel.", 6)
+    if not hasAnyKey() then
+        setStatus("add an api key", THEME.amber, THEME.amber)
+        Log("no API key yet.", THEME.amber)
+        Log("gemini · aistudio.google.com/apikey", THEME.cyan)
+        Log("openrouter · openrouter.ai/keys", THEME.amber)
+        Log("paste one in ⚙ then Save & connect.", THEME.textFaint)
+        SettingsSheet.Visible = true
         return
     end
 
     setBusy(true)
-    StatusLbl.Text = "⏳ connecting…"
-    StatusLbl.TextColor3 = Color3.fromRGB(255, 200, 80)
-    if not silent then
-        Log("🤖 connecting (http: " .. tostring(HTTP_SOURCE) .. ")…", Color3.fromRGB(110, 155, 255))
-    end
+    setStatus("connecting…", THEME.amber, THEME.amber)
+    if not silent then Log("connecting…", THEME.textDim) end
 
     task.spawn(function()
-        local ok, reply, prov, err = pcall(AskAI, "Reply with exactly: CONNECTED", nil, function() end, true)
+        local ok, reply, prov, failures = pcall(AskAI, "Say exactly: CONNECTED", nil, function() end, true)
         if ok and reply then
             Connected = true
-            SetProvBadge(prov)
-            StatusLbl.Text = "✅ online via " .. tostring(prov)
-            StatusLbl.TextColor3 = Color3.fromRGB(46, 200, 110)
-            Log("✅ live on " .. tostring(prov), Color3.fromRGB(46, 200, 110))
-            Log("say 'run it' to auto-execute.", Color3.fromRGB(130, 130, 155))
-            task.spawn(DoScan)
+            setStatus("online · " .. tostring(prov), THEME.mint, THEME.mint)
+            Log("connected via " .. tostring(prov), THEME.mint)
         else
             Connected = false
-            StatusLbl.Text = "❌ all providers down"
-            StatusLbl.TextColor3 = Color3.fromRGB(215, 55, 55)
-            Log("❌ no provider answered.", Color3.fromRGB(215, 55, 55))
-            Log("   " .. tostring(ok and err or reply):sub(1, 200), Color3.fromRGB(180, 70, 70))
-            Log("   → tap ⚙ to paste a working key.", Color3.fromRGB(180, 140, 60))
-            ProvBadge.Text = "  ✦ offline   ·   http: " .. tostring(HTTP_SOURCE)
-            ProvBadge.TextColor3 = Color3.fromRGB(200, 80, 80)
+            setStatus("offline", THEME.coral, THEME.coral)
+            Log(summarizeFailures(ok and failures or { { name = "error", err = tostring(reply) } }),
+                THEME.coral)
+            Log("tip · check your key in ⚙, or pick another model.", THEME.textFaint)
         end
         setBusy(false)
     end)
 end
 
-SaveKeysBtn.MouseButton1Click:Connect(function()
+SaveBtn.MouseButton1Click:Connect(function()
     for _, item in ipairs(settingsBoxes) do
         KEYS[item.key] = (item.box.Text or ""):gsub("%s+", "")
     end
-    saveKeysFile()
-    Settings.Visible = false
-    Log("💾 keys saved — reconnecting…", Color3.fromRGB(60, 200, 140))
-    Connect(true)
+    Prefs.keys = KEYS
+    savePrefs()
+    SettingsSheet.Visible = false
+    Log("keys saved · reconnecting", THEME.mint)
+    task.spawn(function()
+        pcall(FetchGeminiModels, true)
+        pcall(FetchOpenRouterModels, true)
+        Connect(true)
+    end)
 end)
 
-ReconnectBtn.MouseButton1Click:Connect(function()
-    Connect(true)
+RefreshBtn.MouseButton1Click:Connect(function()
+    Log("refreshing model lists…", THEME.textDim)
+    FetchAllModels(true)
 end)
 
--- ══════════════════════════════════════════════════════════════════════════════
--- 11. GO
--- ══════════════════════════════════════════════════════════════════════════════
-Log("🤖 AI Helper loaded (http: " .. tostring(HTTP_SOURCE or "none") .. ")",
-    Color3.fromRGB(110, 155, 255))
-Log("🤖 bubble = open  •  ⚙ = keys  •  drag the title bar to move",
-    Color3.fromRGB(120, 120, 155))
-Notify("AI Helper", "Loaded — tap the 🤖 bubble.", 3)
+--══════════════════════════════════════════════════════════════════════════════
+-- 16.  GO
+--══════════════════════════════════════════════════════════════════════════════
+Log("hi · I'm your roblox copilot.", THEME.text)
+Log("ask for a script, or say 'run it' and I'll execute it.", THEME.textDim)
+if not RawRequest then
+    Log("warning · no http function, so I can't reach any provider.", THEME.coral)
+elseif not hasAnyKey() then
+    Log("add a key in ⚙ to get started.", THEME.amber)
+end
 
-Connect(true) -- handles both diagnostics: no http function, or no API key
+Notify("AI Helper", "Loaded — tap ✦ to open.", 3)
 
-end -- ════════════════════════════════ END SCOPE ════════════════════════════════
+FetchAllModels(false)
+Connect(true)
+
+end --════════════════════════════════ END SCOPE ════════════════════════════════════
