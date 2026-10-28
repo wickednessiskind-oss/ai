@@ -1,8 +1,10 @@
-# AI Script Helper — Roblox executor script
+# AI Helper — Roblox executor script
 
-Single-file Luau script that puts a floating AI chat panel inside Roblox (Delta /
-mobile-friendly). You type what you want, it asks an LLM, and it can run the
-generated script for you.
+A single-file Luau script that puts a small AI copilot panel inside Roblox
+(Delta / mobile friendly). Ask for a script, it fetches it from an LLM provider,
+and can run it for you.
+
+![panel preview](preview.png)
 
 ```
 ai.lua   ← the whole thing, one file, paste into your executor
@@ -10,32 +12,105 @@ ai.lua   ← the whole thing, one file, paste into your executor
 
 ---
 
-## v3 — mobile / Delta fixes (current)
+## v4 — live model lists (this is what fixed "no provider answered")
 
-Two real defects, both visible in the screenshot:
+OpenRouter keeps pulling models out of its free tier (`HTTP 404 … this model is
+unavailable for free`). The old version hardcoded three `:free` slugs, so when
+those were retired every request failed.
 
-1. **`✕ no HTTP function`** — v2 looked the request function up via
-   `_G["request"]`, but **Delta injects `request` into the script environment,
-   not into `_G`**, so the lookup always came back nil. v3 reads the globals
-   directly, then `getgenv()`, then `syn` / `http` / `fluxus` / `krnl` / `delta`
-   namespaces, and prints which one it found in the ⚙ panel.
-2. **The gemini key was rejected** — Google now issues `AQ.…` keys (the old
-   `AIza…` format is deprecated), and an `AQ.` key is only accepted in the
-   **`x-goog-api-key` header**. Sent as `?key=` it returns 404. v3 sends the
-   header first, retries with `?key=`, and walks the model list
-   (`2.5-flash → 2.5-flash-lite → 2.0-flash → 2.0-flash-lite`) because retired
-   model ids 404 too.
+v4 asks the provider what is available **right now**:
 
-GUI:
+* `GET https://openrouter.ai/api/v1/models` → keeps only models where
+  `pricing.prompt == 0` **and** `pricing.completion == 0` and the output
+  modality includes text (that's 20–30 models on a typical day).
+* `GET /v1beta/models` (Gemini) → keeps only models that support
+  `generateContent`, so retired ids can't break it either.
+* Tap the **gemini** or **openrouter** chip to open the live list and pick a
+  model. Your pick is remembered, and the choice shows on the chip.
+* If you never pick, it walks the list until one answers, ending with
+  `openrouter/free`.
+* If a list can't be fetched (offline, bad key), the picker falls back to a
+  built-in shortlist and shows the reason plus a retry button.
+* A failed attempt now ends with **one line per provider** (`openrouter: HTTP
+  404 … | gemini: 429 …`) instead of a wall of JSON.
 
-* **Compact and responsive** — 258–330 px wide, 68 % of the screen high,
-  recalculated from `ViewportSize` on rotation. Every element is positioned
-  from the panel size, so nothing overlaps any more (v2's fixed offsets drew
-  the ASK button on top of the input box on phones).
-* **Draggable** — drag the title bar to move, drag the 🤖 bubble to reposition
-  it; both are clamped to stay on screen, and a drag never counts as a tap.
+## Look and feel
 
-## Why it "did nothing" when you executed it (v1 → v2)
+* Compact: 296–356 px wide, up to 52 % … 74 % of the screen height, always
+  clamped on-screen, and it shrinks its blocks on short/landscape screens.
+* Deep indigo card surfaces with a violet→pink accent, rounded chips, hairline
+  strokes, hover/press feedback on every button, and a small status dot
+  (green = online, amber = working, red = problem).
+* Type: Gotham for prose, Code for the log, with a real hierarchy
+  (title 14 · body 10–12 · meta 8–9) instead of one flat size.
+* Drag the title bar to move the window, drag the ✦ bubble to move the launcher
+  (a drag never counts as a tap).
+
+## Install
+
+1. Open your executor (Delta, Wave, Codex, …) in Roblox.
+2. Paste the entire contents of `ai.lua` and execute it.
+3. Tap the **✦** bubble to open the panel.
+4. Tap **⚙**, paste a key, **Save & connect** — the model lists load by
+   themselves.
+
+Free keys:
+
+* Gemini — <https://aistudio.google.com/apikey> (`AQ.…` keys are current and
+  supported; they are sent in the `x-goog-api-key` header, which is the only
+  way new keys work)
+* OpenRouter — <https://openrouter.ai/keys>
+
+Keys are stored on your device (`ai_helper_keys.json`, git-ignored) — never in
+this repo. GitHub push protection rejects live keys, correctly.
+
+## Using it
+
+| Element | What it does |
+|---|---|
+| ⚙ | API keys + "Refresh model lists" |
+| gemini / openrouter chip | Opens the live model picker |
+| ◎ Scan | Reads the current place (place id, tools, NPCs, remotes) and attaches it to prompts |
+| Ask | Sends the prompt (multi-line, no length limit) |
+| ▶ Run | Appears when the answer contains a script — executes it |
+| ✕ Clear | Clears the log and the conversation memory |
+| title bar | Drag to move the window |
+
+Say **"run it"**, **"run now"** or **"execute it"** and it auto-executes the
+generated script.
+
+## Providers (in order, automatic fallback)
+
+1. **TokenHarbor** — OpenAI-compatible `/chat/completions` (optional)
+2. **Gemini** — `generateContent`, live model list
+3. **OpenRouter** — live list of currently-free models
+
+## Notes and limits
+
+* Needs an executor with an HTTP function (`request`, `http_request`,
+  `syn.request`, …). Delta's `request` is picked up automatically and the panel
+  shows which one it found.
+* `loadstring` must be available to run generated code.
+* Free tiers are rate limited (OpenRouter free ≈ 20 req/min); expect occasional
+  429s.
+* Client-side only — it does what the client can do.
+* Only run generated code you understand: it executes with your executor's
+  privileges.
+
+---
+
+## Bug history
+
+### v3 → v4
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `no provider answered · HTTP 404 (meta-llama/llama-3.3-70b-instruct:free)` | hardcoded `:free` slugs were retired by OpenRouter | fetch `/api/v1/models`, filter `pricing == 0`, auto-fall-back down the live list |
+| Gemini `2.5-flash-lite` failing | retired/unauthorised model id | fetch `/v1beta/models`, keep only `generateContent` models, pick from the list |
+| failure output was a wall of JSON | error bodies were logged raw | one-line summary per provider |
+| font too small, flat look | single text size, flat fills | type hierarchy, gradient surfaces, chips, hover states |
+
+### Why it "did nothing" when you executed it (v1 → v2)
 
 The v1 script **never ran a single line**. Here is what was broken, in order of
 severity:
